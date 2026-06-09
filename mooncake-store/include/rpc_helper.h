@@ -2,8 +2,11 @@
 
 #include <ylt/struct_json/json_writer.h>
 
+#include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -19,11 +22,41 @@
 
 namespace mooncake {
 
-// Slow-RPC log threshold (microseconds). RPCs slower than this emit a single
-// WARNING carrying rpc_name + elapsed_us + rc. The timing is unconditional
-// (does not depend on the VLOG gate), so it works in production where VLOG is
-// off; the cost on the fast path is two steady_clock::now() calls.
-constexpr uint64_t kMasterSlowLogThresholdUs = 3000;
+// ReplicaList slow-log threshold (microseconds). MC_REPLICA_SLOW_US=0 logs
+// every GetReplicaList/BatchGetReplicaList call.
+constexpr uint64_t kDefaultReplicaSlowLogThresholdUs = 100;
+
+inline uint64_t ReplicaSlowLogThresholdUs() {
+    static const uint64_t threshold = [] {
+        const char* value = std::getenv("MC_REPLICA_SLOW_US");
+        if (value == nullptr || *value == '\0') {
+            return kDefaultReplicaSlowLogThresholdUs;
+        }
+        if (*value == '-') {
+            LOG(WARNING) << "Invalid MC_REPLICA_SLOW_US=" << value
+                         << ", falling back to "
+                         << kDefaultReplicaSlowLogThresholdUs << "us";
+            return kDefaultReplicaSlowLogThresholdUs;
+        }
+
+        errno = 0;
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (end == value || *end != '\0' || errno == ERANGE ||
+            parsed > std::numeric_limits<uint64_t>::max()) {
+            LOG(WARNING) << "Invalid MC_REPLICA_SLOW_US=" << value
+                         << ", falling back to "
+                         << kDefaultReplicaSlowLogThresholdUs << "us";
+            return kDefaultReplicaSlowLogThresholdUs;
+        }
+        return static_cast<uint64_t>(parsed);
+    }();
+    return threshold;
+}
+
+inline bool ShouldLogReplicaSlowCall(uint64_t elapsed_us) {
+    return elapsed_us >= ReplicaSlowLogThresholdUs();
+}
 
 template <typename T>
 struct is_tl_expected : std::false_type {};
@@ -67,8 +100,7 @@ auto execute_rpc(std::string_view rpc_name, std::optional<PerfKey> perf_key,
         pt->Start();
     }
 
-    // Unconditional timing for the slow log (ScopedVLogTimer is a no-op when
-    // VLOG is off, so it cannot serve this purpose).
+    const bool enable_replica_slow_log = rpc_name == "GetReplicaList";
     const auto t0 = std::chrono::steady_clock::now();
 
     ScopedVLogTimer timer(1, rpc_name.data());
@@ -89,7 +121,8 @@ auto execute_rpc(std::string_view rpc_name, std::optional<PerfKey> perf_key,
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - t0)
             .count();
-    if (static_cast<uint64_t>(elapsed_us) > kMasterSlowLogThresholdUs) {
+    if (enable_replica_slow_log &&
+        ShouldLogReplicaSlowCall(static_cast<uint64_t>(elapsed_us))) {
         MC_LOG(WARNING) << rpc_name << "_slow elapsed_us[" << elapsed_us
                         << "] rc[" << rc << "]";
     }

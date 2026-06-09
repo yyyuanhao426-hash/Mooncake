@@ -3,8 +3,10 @@
 
 #include <chrono>  // For std::chrono
 #include <csignal>
+#include <dirent.h>
 #include <memory>  // For std::unique_ptr
 #include <thread>  // For std::thread
+#include <unistd.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
@@ -285,6 +287,38 @@ void ResolveRpcAddressFromInterfaceOrDie(
     master_config.rpc_address = resolved_address.value();
     LOG(INFO) << "Resolved rpc_interface=" << master_config.rpc_interface
               << " to rpc_address=" << master_config.rpc_address;
+}
+
+void InitMasterLogging(const char* program_name) {
+    if (!FLAGS_log_dir.empty()) {
+        google::InitGoogleLogging(program_name);
+        return;
+    }
+
+    const char* log_dir_path = std::getenv("MC_LOG_DIR");
+    if (log_dir_path == nullptr || *log_dir_path == '\0') {
+        return;
+    }
+
+    DIR* log_dir = opendir(log_dir_path);
+    if (log_dir == nullptr) {
+        LOG(WARNING) << "Path [" << log_dir_path
+                     << "] is not a valid directory path. Still logging to "
+                        "stderr.";
+        return;
+    }
+    closedir(log_dir);
+    if (access(log_dir_path, W_OK) != 0) {
+        LOG(WARNING) << "Path [" << log_dir_path
+                     << "] is not a permitted directory path for the current "
+                        "user. Still logging to stderr.";
+        return;
+    }
+
+    FLAGS_log_dir = log_dir_path;
+    FLAGS_logtostderr = 0;
+    FLAGS_stop_logging_if_full_disk = true;
+    google::InitGoogleLogging(program_name);
 }
 
 }  // namespace
@@ -963,9 +997,7 @@ int main(int argc, char* argv[]) {
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    if (!FLAGS_log_dir.empty()) {
-        google::InitGoogleLogging(argv[0]);
-    }
+    InitMasterLogging(argv[0]);
     mooncake::logging::ApplyMooncakeLogEnableToGlog();
 
     // Initialize the master configuration

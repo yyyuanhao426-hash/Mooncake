@@ -919,6 +919,7 @@ WrappedMasterService::BatchGetReplicaList(
         trace_scope_ = std::make_unique<mooncake::logging::ScopedTraceId>(
             client_trace_id);
     }
+    const auto slow_log_start = std::chrono::steady_clock::now();
     UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_GET_REPLICA,
                          UbDiag::PerfLevel::SUB_SYSTEM);
     pt.Start();
@@ -962,7 +963,18 @@ WrappedMasterService::BatchGetReplicaList(
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
-    pt.End(failure_count == total_keys ? -1 : 0);
+    const int rc = failure_count == total_keys ? -1 : 0;
+    pt.End(rc);
+    const auto elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - slow_log_start)
+            .count();
+    if (ShouldLogReplicaSlowCall(static_cast<uint64_t>(elapsed_us))) {
+        MC_LOG(WARNING) << "BatchGetReplicaList_slow elapsed_us[" << elapsed_us
+                        << "] total[" << results.size() << "] success["
+                        << (results.size() - failure_count) << "] failures["
+                        << failure_count << "] rc[" << rc << "]";
+    }
     return results;
 }
 
