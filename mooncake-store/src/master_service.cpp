@@ -3286,11 +3286,15 @@ auto MasterService::NotifyOffloadSuccess(
     }
     // Track total SSD usage increment for this batch
     int64_t total_ssd_increment = 0;
+    // Collect keys for debug logging (avoids holding any lock while logging).
+    std::vector<std::pair<std::string, int64_t>> offloaded_keys;
+    offloaded_keys.reserve(tasks.size());
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
         const auto& metadata = metadatas[i];
         const auto object_id = MakeObjectIdentity(task.key, task.tenant_id);
         total_ssd_increment += metadata.data_size;
+        offloaded_keys.emplace_back(task.key, metadata.data_size);
         // Release refcnt and clear offloading task.
         {
             MetadataAccessorRW accessor(this, object_id);
@@ -3322,6 +3326,22 @@ auto MasterService::NotifyOffloadSuccess(
                           << ", key=" << object_id.user_key;
             return tl::make_unexpected(res.error());
         }
+    }
+
+    // Debug log: record which keys were successfully offloaded to SSD.
+    // Enable with --v=1. Helps track data movement from MEMORY to
+    // LOCAL_DISK and correlate with offload task lifecycle.
+    if (!offloaded_keys.empty() && mooncake::logging::ShouldVLog(1)) {
+        std::string keys_str;
+        for (size_t i = 0; i < offloaded_keys.size(); ++i) {
+            if (i > 0) keys_str += ", ";
+            keys_str += offloaded_keys[i].first + "(" +
+                        std::to_string(offloaded_keys[i].second) + "B)";
+        }
+        MC_VLOG(1) << "[OFFLOAD-SUCCESS] client_id=" << client_id
+                   << ", count=" << offloaded_keys.size()
+                   << ", bytes=" << total_ssd_increment
+                   << ", keys=[" << keys_str << "]";
     }
 
     // Update SSD usage tracking for this client
@@ -3792,6 +3812,12 @@ void MasterService::EvictionThreadFunc() {
     MC_VLOG(1) << "action=eviction_thread_started";
 
     auto last_discard_time = std::chrono::system_clock::now();
+    // Interval for dumping the offloading queue snapshot. Independent from
+    // the eviction/discard cadence so we get regular visibility even when
+    // the system is idle or under sustained memory pressure.
+    constexpr auto kOffloadQueueLogInterval = std::chrono::seconds(10);
+    auto last_offload_queue_log_time = std::chrono::system_clock::now();
+
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio =
@@ -3830,6 +3856,14 @@ void MasterService::EvictionThreadFunc() {
             last_discard_time = now;
         }
 
+        // Periodically dump the first 10 keys pending in each client's
+        // offloading queue. Helps correlate offload backlog with task
+        // expiry events and identify stuck clients.
+        if (now - last_offload_queue_log_time >= kOffloadQueueLogInterval) {
+            LogOffloadingQueueSnapshot(10);
+            last_offload_queue_log_time = now;
+        }
+
 #ifdef USE_NOF
         double nof_used_ratio =
             MasterMetricManager::instance().get_global_nof_used_ratio();
@@ -3851,6 +3885,81 @@ void MasterService::EvictionThreadFunc() {
     }
 
     MC_VLOG(1) << "action=eviction_thread_stopped";
+}
+
+void MasterService::LogOffloadingQueueSnapshot(size_t max_keys_per_client) {
+    // Snapshot the offloading queues of all clients under a short-lived lock.
+    // We copy out the first N keys per client to avoid holding
+    // offloading_mutex_ while doing log I/O.
+    struct ClientSnapshot {
+        UUID client_id;
+        size_t total_pending;
+        std::vector<std::pair<std::string, int64_t>> sample_keys;  // (key, size)
+    };
+    std::vector<ClientSnapshot> snapshots;
+
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        const auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+
+        snapshots.reserve(client_local_disk_segment.size());
+        for (const auto& [cid, seg_ptr] : client_local_disk_segment) {
+            ClientSnapshot snap;
+            snap.client_id = cid;
+            MutexLocker locker(&seg_ptr->offloading_mutex_);
+            snap.total_pending = seg_ptr->offloading_objects.size();
+            if (snap.total_pending == 0) {
+                snapshots.push_back(std::move(snap));
+                continue;
+            }
+            snap.sample_keys.reserve(
+                std::min(max_keys_per_client, snap.total_pending));
+            size_t added = 0;
+            for (const auto& [storage_key, item] : seg_ptr->offloading_objects) {
+                if (added >= max_keys_per_client) break;
+                snap.sample_keys.emplace_back(item.key, item.size);
+                ++added;
+            }
+            snapshots.push_back(std::move(snap));
+        }
+    }
+
+    // Log outside the lock. Skip entirely if nothing is pending anywhere —
+    // avoids log spam when the system is idle. Enable with --v=1.
+    bool any_pending = false;
+    for (const auto& snap : snapshots) {
+        if (snap.total_pending > 0) {
+            any_pending = true;
+            break;
+        }
+    }
+    if (!any_pending || !mooncake::logging::ShouldVLog(1)) {
+        return;
+    }
+
+    for (const auto& snap : snapshots) {
+        if (snap.total_pending == 0) {
+            continue;
+        }
+        std::string keys_str;
+        for (size_t i = 0; i < snap.sample_keys.size(); ++i) {
+            if (i > 0) keys_str += ", ";
+            keys_str += snap.sample_keys[i].first + "(" +
+                         std::to_string(snap.sample_keys[i].second) + "B)";
+        }
+        std::string truncation_hint =
+            snap.total_pending > snap.sample_keys.size()
+                ? ", ... (" + std::to_string(snap.total_pending -
+                                              snap.sample_keys.size()) +
+                      " more)"
+                : "";
+        MC_VLOG(1) << "[OFFLOAD-QUEUE] client_id=" << snap.client_id
+                   << ", pending=" << snap.total_pending
+                   << ", first_" << snap.sample_keys.size()
+                   << "_keys=[" << keys_str << truncation_hint << "]";
+    }
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(
