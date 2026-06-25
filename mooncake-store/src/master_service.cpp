@@ -1749,10 +1749,20 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                 auto result = PushOffloadingQueue(object_id, replica);
                 if (result) {
                     replica.inc_refcnt();
+                    auto enqueue_time = std::chrono::system_clock::now();
                     tenant_state.offloading_tasks.emplace(
                         object_id.user_key,
-                        OffloadingTask{replica.id(),
-                                       std::chrono::system_clock::now()});
+                        OffloadingTask{replica.id(), enqueue_time});
+                    // Log the enqueue event so the parser script can
+                    // reconstruct the key's offload lifecycle:
+                    // enqueue (PutEnd) -> dequeue (heartbeat) ->
+                    // success/expiry.
+                    MC_LOG(INFO) << "[OFFLOAD-ENQUEUE] key="
+                                 << object_id.user_key
+                                 << ", tenant=" << object_id.tenant_id
+                                 << ", source_id=" << replica.id()
+                                 << ", enqueue_time="
+                                 << FormatTimestamp(enqueue_time);
                 }
             });
     }
@@ -3206,6 +3216,22 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                  local_disk_segment_it->second->offloading_objects) {
                 result.push_back(task);
             }
+            // Log the dequeue event so the parser script can track when
+            // each key left the offload queue (handed off to the client
+            // for SSD write).
+            if (!result.empty()) {
+                auto dequeue_time = std::chrono::system_clock::now();
+                std::string keys_str;
+                for (size_t i = 0; i < result.size(); ++i) {
+                    if (i > 0) keys_str += ", ";
+                    keys_str += result[i].key;
+                }
+                MC_LOG(INFO) << "[OFFLOAD-DEQUEUE] client_id=" << client_id
+                             << ", count=" << result.size()
+                             << ", dequeue_time="
+                             << FormatTimestamp(dequeue_time)
+                             << ", keys=[" << keys_str << "]";
+            }
             local_disk_segment_it->second->offloading_objects.clear();
             return result;
         }
@@ -3328,20 +3354,21 @@ auto MasterService::NotifyOffloadSuccess(
         }
     }
 
-    // Debug log: record which keys were successfully offloaded to SSD.
-    // Enable with --v=1. Helps track data movement from MEMORY to
-    // LOCAL_DISK and correlate with offload task lifecycle.
-    if (!offloaded_keys.empty() && mooncake::logging::ShouldVLog(1)) {
+    // Log every key that was successfully offloaded to SSD. INFO level so
+    // the offload lifecycle is observable without --v=1. The parser script
+    // correlates this with enqueue/dequeue/expiry logs to reconstruct each
+    // key's timeline.
+    if (!offloaded_keys.empty()) {
         std::string keys_str;
         for (size_t i = 0; i < offloaded_keys.size(); ++i) {
             if (i > 0) keys_str += ", ";
             keys_str += offloaded_keys[i].first + "(" +
                         std::to_string(offloaded_keys[i].second) + "B)";
         }
-        MC_VLOG(1) << "[OFFLOAD-SUCCESS] client_id=" << client_id
-                   << ", count=" << offloaded_keys.size()
-                   << ", bytes=" << total_ssd_increment
-                   << ", keys=[" << keys_str << "]";
+        MC_LOG(INFO) << "[OFFLOAD-SUCCESS] client_id=" << client_id
+                     << ", count=" << offloaded_keys.size()
+                     << ", bytes=" << total_ssd_increment
+                     << ", keys=[" << keys_str << "]";
     }
 
     // Update SSD usage tracking for this client
@@ -3856,11 +3883,11 @@ void MasterService::EvictionThreadFunc() {
             last_discard_time = now;
         }
 
-        // Periodically dump the first 10 keys pending in each client's
-        // offloading queue. Helps correlate offload backlog with task
-        // expiry events and identify stuck clients.
+        // Periodically dump all keys pending in each client's offloading
+        // queue. Helps correlate offload backlog with task expiry events
+        // and identify stuck clients.
         if (now - last_offload_queue_log_time >= kOffloadQueueLogInterval) {
-            LogOffloadingQueueSnapshot(10);
+            LogOffloadingQueueSnapshot();
             last_offload_queue_log_time = now;
         }
 
@@ -3887,14 +3914,14 @@ void MasterService::EvictionThreadFunc() {
     MC_VLOG(1) << "action=eviction_thread_stopped";
 }
 
-void MasterService::LogOffloadingQueueSnapshot(size_t max_keys_per_client) {
+void MasterService::LogOffloadingQueueSnapshot() {
     // Snapshot the offloading queues of all clients under a short-lived lock.
-    // We copy out the first N keys per client to avoid holding
-    // offloading_mutex_ while doing log I/O.
+    // We copy out every pending key per client so the parser script can
+    // track exactly which keys are stuck and for how long. Lock is released
+    // before doing log I/O to avoid blocking the heartbeat thread.
     struct ClientSnapshot {
         UUID client_id;
-        size_t total_pending;
-        std::vector<std::pair<std::string, int64_t>> sample_keys;  // (key, size)
+        std::vector<std::pair<std::string, int64_t>> keys;  // (key, size)
     };
     std::vector<ClientSnapshot> snapshots;
 
@@ -3909,56 +3936,33 @@ void MasterService::LogOffloadingQueueSnapshot(size_t max_keys_per_client) {
             ClientSnapshot snap;
             snap.client_id = cid;
             MutexLocker locker(&seg_ptr->offloading_mutex_);
-            snap.total_pending = seg_ptr->offloading_objects.size();
-            if (snap.total_pending == 0) {
-                snapshots.push_back(std::move(snap));
-                continue;
+            if (seg_ptr->offloading_objects.empty()) {
+                continue;  // skip clients with nothing pending
             }
-            snap.sample_keys.reserve(
-                std::min(max_keys_per_client, snap.total_pending));
-            size_t added = 0;
+            snap.keys.reserve(seg_ptr->offloading_objects.size());
             for (const auto& [storage_key, item] : seg_ptr->offloading_objects) {
-                if (added >= max_keys_per_client) break;
-                snap.sample_keys.emplace_back(item.key, item.size);
-                ++added;
+                snap.keys.emplace_back(item.key, item.size);
             }
             snapshots.push_back(std::move(snap));
         }
     }
 
     // Log outside the lock. Skip entirely if nothing is pending anywhere —
-    // avoids log spam when the system is idle. Enable with --v=1.
-    bool any_pending = false;
-    for (const auto& snap : snapshots) {
-        if (snap.total_pending > 0) {
-            any_pending = true;
-            break;
-        }
-    }
-    if (!any_pending || !mooncake::logging::ShouldVLog(1)) {
+    // avoids log spam when the system is idle.
+    if (snapshots.empty()) {
         return;
     }
 
     for (const auto& snap : snapshots) {
-        if (snap.total_pending == 0) {
-            continue;
-        }
         std::string keys_str;
-        for (size_t i = 0; i < snap.sample_keys.size(); ++i) {
+        for (size_t i = 0; i < snap.keys.size(); ++i) {
             if (i > 0) keys_str += ", ";
-            keys_str += snap.sample_keys[i].first + "(" +
-                         std::to_string(snap.sample_keys[i].second) + "B)";
+            keys_str += snap.keys[i].first + "(" +
+                         std::to_string(snap.keys[i].second) + "B)";
         }
-        std::string truncation_hint =
-            snap.total_pending > snap.sample_keys.size()
-                ? ", ... (" + std::to_string(snap.total_pending -
-                                              snap.sample_keys.size()) +
-                      " more)"
-                : "";
-        MC_VLOG(1) << "[OFFLOAD-QUEUE] client_id=" << snap.client_id
-                   << ", pending=" << snap.total_pending
-                   << ", first_" << snap.sample_keys.size()
-                   << "_keys=[" << keys_str << truncation_hint << "]";
+        MC_LOG(INFO) << "[OFFLOAD-QUEUE] client_id=" << snap.client_id
+                     << ", pending=" << snap.keys.size()
+                     << ", keys=[" << keys_str << "]";
     }
 }
 
@@ -4064,7 +4068,14 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 }
             }
             MC_LOG(WARNING)
-                << "Offloading task expired for key: " << task_it->first;
+                << "Offloading task expired for key: " << task_it->first
+                << ", enqueue_time="
+                << FormatTimestamp(task_it->second.start_time)
+                << ", expired_time=" << FormatTimestamp(now)
+                << ", elapsed_sec="
+                << std::chrono::duration_cast<std::chrono::seconds>(
+                       now - task_it->second.start_time)
+                       .count();
             task_it = tenant_state.offloading_tasks.erase(task_it);
         }
 

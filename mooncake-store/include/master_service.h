@@ -1306,10 +1306,10 @@ class MasterService {
 
     // Eviction thread function
     void EvictionThreadFunc();
-    // Periodically log the first N keys pending in each client's
-    // offloading queue (LOCAL_DISK segment). Helps debug offload
-    // backlog and correlate with task expiry events.
-    void LogOffloadingQueueSnapshot(size_t max_keys_per_client = 10);
+    // Periodically log all keys pending in each client's offloading
+    // queue (LOCAL_DISK segment). Helps debug offload backlog and
+    // correlate with task expiry events.
+    void LogOffloadingQueueSnapshot();
     void NofHeartbeatThreadFunc();
     bool TryUnmountNoFSegmentByHeartbeat(
         const MountedNoFSegmentSnapshot& snapshot,
