@@ -1,5 +1,6 @@
 #include "file_storage.h"
 
+#include <future>
 #include <memory>
 #include <vector>
 
@@ -90,6 +91,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         GetEnvStringOr("MOONCAKE_OFFLOAD_USE_URING",
                        GetEnvStringOr("MOONCAKE_USE_URING", "false"));
     config.use_uring = (use_uring_str == "true" || use_uring_str == "1");
+
+    config.offload_write_threads = GetEnvOr<uint32_t>(
+        "MOONCAKE_OFFLOAD_WRITE_THREADS", config.offload_write_threads);
 
     return config;
 }
@@ -197,6 +201,13 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 
     storage_backend_ = create_storage_backend_result.value();
 
+    if (config_.offload_write_threads > 1) {
+        offload_pool_ =
+            std::make_unique<ThreadPool>(config_.offload_write_threads);
+        LOG(INFO) << "FileStorage: offload write thread pool size = "
+                  << config_.offload_write_threads;
+    }
+
     // Register the client buffer with the process-wide io_uring fixed-buffer
     // mechanism. This must happen before any I/O threads start so that they
     // can lazily pick up the registration on their first I/O call.
@@ -228,6 +239,11 @@ FileStorage::~FileStorage() {
     client_buffer_gc_running_ = false;
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
+    }
+    // Heartbeat thread (the only producer of offload tasks) is already joined,
+    // so stopping the pool here just drains and joins its workers.
+    if (offload_pool_) {
+        offload_pool_->stop();
     }
 }
 
@@ -423,7 +439,12 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         return ErrorCode::OK;
     };
 
-    for (const auto& keys : buckets_keys) {
+    // Process a single bucket end-to-end: query memory slices, stage D2H,
+    // write to SSD. Self-contained (all locals are per-invocation) so it is
+    // safe to run for multiple buckets concurrently. Returns ErrorCode::OK on
+    // success (or when the bucket is skipped); a non-OK code on failure.
+    auto process_one_bucket =
+        [&](const std::vector<std::string>& keys) -> ErrorCode {
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         std::unordered_map<std::string, std::vector<std::string>>
             storage_keys_by_tenant;
@@ -458,7 +479,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
         }
         if (batch_object.empty()) {
-            continue;
+            return ErrorCode::OK;
         }
 
         auto eviction_handler = [this](const std::vector<std::string>&
@@ -553,14 +574,59 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
-            if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
-                MutexLocker locker(&offloading_mutex_);
-                enable_offloading_ = false;
-                return tl::make_unexpected(offload_res.error());
-            }
+            // KEYS_ULTRA_LIMIT (disables offloading) is handled by the caller
+            // after fan-in; INVALID_READ is tolerated (skipped).
             if (offload_res.error() != ErrorCode::INVALID_READ) {
-                return tl::make_unexpected(offload_res.error());
+                return offload_res.error();
             }
+        }
+        return ErrorCode::OK;
+    };
+
+    // Apply a per-bucket result, mirroring the original early-return behavior:
+    // KEYS_ULTRA_LIMIT disables offloading; any other non-OK code aborts.
+    auto handle_bucket_error =
+        [this](ErrorCode ec) -> tl::expected<void, ErrorCode> {
+        if (ec == ErrorCode::KEYS_ULTRA_LIMIT) {
+            MutexLocker locker(&offloading_mutex_);
+            enable_offloading_ = false;
+        }
+        return tl::make_unexpected(ec);
+    };
+
+    // Dispatch each bucket to the offload thread pool so the per-bucket
+    // query -> D2H staging -> SSD write pipeline runs concurrently. With
+    // offload_write_threads <= 1 the pool is null and we keep the serial path.
+    if (offload_pool_ && buckets_keys.size() > 1) {
+        std::vector<ErrorCode> results(buckets_keys.size(), ErrorCode::OK);
+        std::vector<std::future<void>> futures;
+        futures.reserve(buckets_keys.size());
+        for (size_t i = 0; i < buckets_keys.size(); ++i) {
+            auto prom = std::make_shared<std::promise<void>>();
+            futures.push_back(prom->get_future());
+            offload_pool_->enqueue([&, i, prom]() {
+                results[i] = process_one_bucket(buckets_keys[i]);
+                prom->set_value();
+            });
+        }
+        // Fan-in: every bucket must finish before we return. future::get()
+        // also establishes happens-before with the worker's write to
+        // results[i].
+        for (auto& f : futures) {
+            f.get();
+        }
+        for (const auto& ec : results) {
+            if (ec != ErrorCode::OK) {
+                return handle_bucket_error(ec);
+            }
+        }
+        return {};
+    }
+
+    for (const auto& keys : buckets_keys) {
+        ErrorCode ec = process_one_bucket(keys);
+        if (ec != ErrorCode::OK) {
+            return handle_bucket_error(ec);
         }
     }
     return {};

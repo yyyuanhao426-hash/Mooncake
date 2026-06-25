@@ -1233,21 +1233,8 @@ BucketStorageBackend::BucketStorageBackend(
     : StorageBackendInterface(file_storage_config_),
       storage_path_(file_storage_config_.storage_filepath),
       bucket_backend_config_(bucket_backend_config_) {
-    // Allocate aligned buffer for O_DIRECT I/O operations
-    void* buf = nullptr;
-    int ret = posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
-    if (ret != 0) {
-        LOG(ERROR)
-            << "BucketStorageBackend: Failed to allocate aligned buffer: "
-            << strerror(ret);
-    } else {
-        aligned_io_buffer_.reset(buf);
-        // Update the deleter to use free
-        aligned_io_buffer_ = std::unique_ptr<void, void (*)(void*)>(
-            buf, [](void* p) { free(p); });
-        LOG(INFO) << "BucketStorageBackend: Allocated " << kAlignedBufferSize
-                  << " bytes aligned buffer at " << buf;
-    }
+    // The aligned O_DIRECT scratch buffer is now thread-local (allocated lazily
+    // in WriteBucket) so concurrent offload workers do not share it.
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
@@ -1998,9 +1985,27 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
                                                            [](void*) {}};
 
-        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
-            // Use the pre-allocated buffer
-            write_buffer = aligned_io_buffer_.get();
+        if (aligned_size <= kAlignedBufferSize) {
+            // Per-thread scratch buffer: concurrent offload workers each call
+            // WriteBucket, so the buffer must not be shared (the previous
+            // shared aligned_io_buffer_ member was a data race under
+            // multi-threaded offload). Each worker allocates its own once.
+            static thread_local std::unique_ptr<void, void (*)(void*)>
+                tls_aligned_buffer{nullptr, [](void*) {}};
+            if (!tls_aligned_buffer) {
+                void* buf = nullptr;
+                int ret =
+                    posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
+                if (ret != 0) {
+                    LOG(ERROR) << "Failed to allocate thread-local aligned "
+                                  "buffer for WriteBucket: "
+                               << strerror(ret);
+                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                tls_aligned_buffer = std::unique_ptr<void, void (*)(void*)>(
+                    buf, [](void* p) { free(p); });
+            }
+            write_buffer = tls_aligned_buffer.get();
         } else {
             // Allocate a temporary larger buffer
             void* buf = nullptr;

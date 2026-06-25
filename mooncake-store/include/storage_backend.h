@@ -234,6 +234,11 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // Number of worker threads used to write offload buckets concurrently in
+    // FileStorage::OffloadObjects. 1 (default) keeps the original serial path;
+    // >1 dispatches per-bucket writes to a thread pool.
+    uint32_t offload_write_threads = 1;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
@@ -951,8 +956,6 @@ class BucketStorageBackend : public StorageBackendInterface {
     // Aligned buffer for O_DIRECT I/O operations
     // We use a fixed-size buffer to avoid frequent allocations
     static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;  // 16MB
-    std::unique_ptr<void, void (*)(void*)> aligned_io_buffer_{nullptr,
-                                                              [](void*) {}};
     /**
      * @brief A shared mutex to protect concurrent access to metadata.
      *
