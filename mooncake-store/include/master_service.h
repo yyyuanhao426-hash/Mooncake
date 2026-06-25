@@ -1106,6 +1106,11 @@ class MasterService {
     struct OffloadingTask {
         ReplicaID source_id;
         std::chrono::system_clock::time_point start_time;
+        // Number of times this task has been re-queued after exceeding
+        // put_start_release_timeout_sec_. When retry_count reaches
+        // offload_max_retries_, the reaper stops re-queuing and grants
+        // a grace lease to protect the object from eviction.
+        uint32_t retry_count{0};
     };
 
     // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
@@ -1145,7 +1150,9 @@ class MasterService {
         std::unordered_set<std::string> processing_keys;
         std::unordered_map<std::string, const ReplicationTask>
             replication_tasks;
-        std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
+        // OffloadingTask is mutable: the reaper resets start_time and bumps
+        // retry_count when re-queueing an expired task.
+        std::unordered_map<std::string, OffloadingTask> offloading_tasks;
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
 
         std::unordered_map<std::string, std::unordered_set<std::string>>
@@ -1306,6 +1313,10 @@ class MasterService {
 
     // Eviction thread function
     void EvictionThreadFunc();
+    // Periodically log the first N keys pending in each client's
+    // offloading queue (LOCAL_DISK segment). Helps debug offload
+    // backlog and correlate with task expiry events.
+    void LogOffloadingQueueSnapshot(size_t max_keys_per_client = 20);
     void NofHeartbeatThreadFunc();
     bool TryUnmountNoFSegmentByHeartbeat(
         const MountedNoFSegmentSnapshot& snapshot,
@@ -1803,6 +1814,9 @@ class MasterService {
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
     const std::chrono::seconds put_start_release_timeout_sec_;
+    // Offload task re-queue config. See master_config.h for semantics.
+    const uint32_t offload_max_retries_;
+    const uint64_t offload_grace_lease_ttl_ms_;
     const std::string cxl_path_;
     const size_t cxl_size_;
     bool enable_cxl_;

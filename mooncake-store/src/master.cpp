@@ -207,6 +207,15 @@ DEFINE_uint64(put_start_release_timeout_sec,
               mooncake::DEFAULT_PUT_START_RELEASE_TIMEOUT,
               "Timeout for releasing space allocated in uncompleted PutStart "
               "operations");
+DEFINE_uint32(offload_max_retries, 3,
+              "Max re-queue attempts for an offload task whose TTL has "
+              "expired. 0 = disable re-queue (legacy behavior). After "
+              "exhausting retries, a grace lease is granted to protect "
+              "the object from immediate eviction.");
+DEFINE_uint64(offload_grace_lease_ttl_ms, 300000,
+              "Grace lease TTL (ms) granted to an object after offload "
+              "retries are exhausted. 0 = no grace lease (object becomes "
+              "immediately evictable, legacy behavior).");
 DEFINE_bool(enable_disk_eviction, true,
             "Enable disk eviction feature for storage backend (default: true)");
 DEFINE_uint64(
@@ -422,6 +431,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("put_start_release_timeout_sec",
                              &master_config.put_start_release_timeout_sec,
                              FLAGS_put_start_release_timeout_sec);
+    default_config.GetUInt32("offload_max_retries",
+                             &master_config.offload_max_retries_,
+                             FLAGS_offload_max_retries);
+    default_config.GetUInt64("offload_grace_lease_ttl_ms",
+                             &master_config.offload_grace_lease_ttl_ms_,
+                             FLAGS_offload_grace_lease_ttl_ms);
     default_config.GetBool("enable_disk_eviction",
                            &master_config.enable_disk_eviction,
                            FLAGS_enable_disk_eviction);
@@ -795,6 +810,17 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.put_start_release_timeout_sec =
             FLAGS_put_start_release_timeout_sec;
     }
+    if ((google::GetCommandLineFlagInfo("offload_max_retries", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_max_retries_ = FLAGS_offload_max_retries;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_grace_lease_ttl_ms", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_grace_lease_ttl_ms_ =
+            FLAGS_offload_grace_lease_ttl_ms;
+    }
     if ((google::GetCommandLineFlagInfo("enable_disk_eviction", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1124,6 +1150,9 @@ int main(int argc, char* argv[]) {
         << master_config.put_start_discard_timeout_sec
         << ", put_start_release_timeout_sec="
         << master_config.put_start_release_timeout_sec
+        << ", offload_max_retries=" << master_config.offload_max_retries_
+        << ", offload_grace_lease_ttl_ms="
+        << master_config.offload_grace_lease_ttl_ms_
         << ", max_total_finished_tasks="
         << master_config.max_total_finished_tasks
         << ", max_total_pending_tasks=" << master_config.max_total_pending_tasks

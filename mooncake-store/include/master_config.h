@@ -67,6 +67,9 @@ struct MasterConfig {
 
     uint64_t put_start_discard_timeout_sec;
     uint64_t put_start_release_timeout_sec;
+    // Offload task re-queue config (see MasterServiceConfigBuilder for docs).
+    uint32_t offload_max_retries_ = 3;
+    uint64_t offload_grace_lease_ttl_ms_ = 300000;  // 5 minutes
 
     // Storage backend eviction configuration
     bool enable_disk_eviction;
@@ -605,6 +608,16 @@ class MasterServiceConfigBuilder {
     uint64_t quota_bytes_ = 0;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    // Max re-queue attempts for an offload task whose TTL has expired.
+    // 0 = disable re-queue (legacy behavior: expire → dec_refcnt → erase).
+    // After exhausting retries, the reaper grants a grace lease to the
+    // object so it survives until the client retries offload or reads it.
+    uint32_t offload_max_retries_ = 3;
+    // Grace lease TTL (ms) granted to an object after offload retries are
+    // exhausted. Keeps the object alive in memory, giving the client a
+    // window to re-issue PutEnd or read the data. Set to 0 to disable
+    // the grace lease (object becomes immediately evictable, legacy behavior).
+    uint64_t offload_grace_lease_ttl_ms_ = 300000;  // 5 minutes
     bool enable_snapshot_restore_ = false;
     bool enable_snapshot_ = false;
     std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
@@ -764,6 +777,18 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_put_start_release_timeout_sec(
         uint64_t put_start_release_timeout_sec) {
         put_start_release_timeout_sec_ = put_start_release_timeout_sec;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_offload_max_retries(
+        uint32_t offload_max_retries) {
+        offload_max_retries_ = offload_max_retries;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_offload_grace_lease_ttl_ms(
+        uint64_t offload_grace_lease_ttl_ms) {
+        offload_grace_lease_ttl_ms_ = offload_grace_lease_ttl_ms;
         return *this;
     }
 
@@ -1070,6 +1095,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.allocation_strategy_type = allocation_strategy_type_;
     config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
+    config.offload_max_retries_ = offload_max_retries_;
+    config.offload_grace_lease_ttl_ms_ = offload_grace_lease_ttl_ms_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
     config.enable_snapshot_restore = enable_snapshot_restore_;
