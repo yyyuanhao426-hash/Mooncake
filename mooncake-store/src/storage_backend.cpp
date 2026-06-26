@@ -1853,6 +1853,11 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
     return ungrouped_offloading_objects_.size();
 }
 
+int64_t BucketStorageBackend::TailIdleHeartbeats() const {
+    MutexLocker locker(&offloading_mutex_);
+    return tail_idle_heartbeats_;
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys) {
@@ -1912,6 +1917,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                        << "key=" << key << ", object_size=" << size
                        << ", limit="
                        << bucket_backend_config_.bucket_size_limit;
+            // An oversized object can never fit any bucket. Drop it from the
+            // ungrouped pool (via grouped_keys) instead of re-checking it every
+            // heartbeat -- otherwise it would log forever and keep the tail
+            // non-empty, blocking the idle-flush from ever clearing.
+            grouped_keys.push_back(key);
             continue;
         }
 

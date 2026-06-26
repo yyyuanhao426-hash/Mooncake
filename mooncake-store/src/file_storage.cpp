@@ -363,23 +363,28 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& offloading_objects) {
-    if (offloading_objects.empty()) {
+    // A partial "tail" bucket left by an earlier heartbeat lives in the bucket
+    // backend's ungrouped pool and can only be flushed by re-entering the
+    // grouping path so its idle-heartbeat counter advances. So even when the
+    // master returns no new objects this cycle, we must still proceed while a
+    // pending tail exists -- otherwise that tail would never reach SSD.
+    auto bucket_backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    const bool has_pending_tail =
+        bucket_backend && bucket_backend->UngroupedOffloadingObjectsSize() > 0;
+    if (offloading_objects.empty() && !has_pending_tail) {
         return {};
     }
     std::unordered_map<std::string, int64_t> storage_object_sizes;
-    std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key;
     storage_object_sizes.reserve(offloading_objects.size());
-    task_by_storage_key.reserve(offloading_objects.size());
     for (const auto& task : offloading_objects) {
         const auto storage_key =
             MakeTenantScopedStorageKey(task.tenant_id, task.key);
         storage_object_sizes.emplace(storage_key, task.size);
-        task_by_storage_key.emplace(storage_key, task);
     }
 
     std::vector<std::vector<std::string>> buckets_keys;
-    if (auto bucket_backend =
-            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
+    if (bucket_backend) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
             storage_object_sizes, buckets_keys);
         if (!allocate_res) {
@@ -397,23 +402,17 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     }
 
     auto complete_handler =
-        [this, &task_by_storage_key](
-            const std::vector<std::string>& keys,
-            std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        [this](const std::vector<std::string>& keys,
+               std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
         VLOG(1) << "Success to store objects, keys count: " << keys.size();
         for (auto& metadata : metadatas) {
             metadata.transport_endpoint = local_rpc_addr_;
         }
-        std::vector<OffloadTaskItem> tasks;
-        tasks.reserve(keys.size());
-        for (const auto& key : keys) {
-            auto it = task_by_storage_key.find(key);
-            if (it == task_by_storage_key.end()) {
-                LOG(ERROR) << "Offload task not found for storage key";
-                return ErrorCode::INVALID_KEY;
-            }
-            tasks.push_back(it->second);
-        }
+        // Recover tenant/key straight from the tenant-scoped storage keys so
+        // that tail keys carried over from an earlier heartbeat (no longer in
+        // this cycle's task list) still resolve. Reuses the same helper as the
+        // ScanMeta/ReRegister paths to keep task construction in one place.
+        auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
         auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
         if (!result) {
             LOG(ERROR) << "NotifyOffloadSuccess failed with error: "
@@ -425,21 +424,22 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
     for (const auto& keys : buckets_keys) {
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
+        // Group by tenant, parsing each tenant-scoped storage key once with the
+        // same idiom used elsewhere in this file. Keep the storage key (to map
+        // query results back) and its user key (to query the segment) in
+        // index-aligned per-tenant vectors.
         std::unordered_map<std::string, std::vector<std::string>>
             storage_keys_by_tenant;
+        std::unordered_map<std::string, std::vector<std::string>>
+            user_keys_by_tenant;
         for (const auto& storage_key : keys) {
-            const auto it = task_by_storage_key.find(storage_key);
-            if (it != task_by_storage_key.end()) {
-                storage_keys_by_tenant[it->second.tenant_id].push_back(
-                    storage_key);
-            }
+            auto [tenant_id, user_key] =
+                ParseTenantScopedStorageKey(storage_key);
+            storage_keys_by_tenant[tenant_id].push_back(storage_key);
+            user_keys_by_tenant[tenant_id].push_back(std::move(user_key));
         }
         for (const auto& [tenant_id, storage_keys] : storage_keys_by_tenant) {
-            std::vector<std::string> user_keys;
-            user_keys.reserve(storage_keys.size());
-            for (const auto& storage_key : storage_keys) {
-                user_keys.push_back(task_by_storage_key[storage_key].key);
-            }
+            const auto& user_keys = user_keys_by_tenant.at(tenant_id);
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
             auto query_result = BatchQuerySegmentSlices(user_keys, tenant_id,
@@ -663,10 +663,12 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
-    if (offloading_objects.empty()) {
-        return {};
-    }
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
+    // Call OffloadObjects unconditionally: even when the master returned no new
+    // objects this cycle, a partial tail bucket left by an earlier cycle must
+    // still be flushed once it has idled long enough. OffloadObjects()
+    // short-circuits internally when there is neither new work nor a pending
+    // tail, so the empty-heartbeat fast path stays cheap.
     auto offload_result = OffloadObjects(offloading_objects);
     if (!offload_result) {
         LOG(ERROR) << "Failed to persist objects with error: "

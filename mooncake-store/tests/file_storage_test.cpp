@@ -92,6 +92,21 @@ class FileStorageTest : public ::testing::Test {
         return bucket_backend->UngroupedOffloadingObjectsSize();
     }
 
+    int64_t GetTailIdleHeartbeats(FileStorage& fileStorage) {
+        auto bucket_backend = std::dynamic_pointer_cast<BucketStorageBackend>(
+            fileStorage.storage_backend_);
+        if (!bucket_backend) {
+            return 0;
+        }
+        return bucket_backend->TailIdleHeartbeats();
+    }
+
+    tl::expected<void, ErrorCode> FileStorageOffloadObjects(
+        FileStorage& fileStorage,
+        const std::vector<OffloadTaskItem>& offloading_objects) {
+        return fileStorage.OffloadObjects(offloading_objects);
+    }
+
     void TearDown() override {
         google::ShutdownGoogleLogging();
         LOG(INFO) << "Clear test data...";
@@ -321,6 +336,78 @@ TEST_F(FileStorageTest,
     ASSERT_EQ(buckets_keys.size(), 1);
     ASSERT_EQ(buckets_keys[0].size(), 7);
     ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
+}
+
+// An object larger than the bucket size limit can never be grouped. It must be
+// dropped from the ungrouped pool rather than retained, otherwise it would log
+// an error and keep the tail non-empty on every heartbeat, which (now that
+// empty heartbeats also drive grouping) would never let the idle-flush settle.
+TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_drops_oversized_object) {
+    std::vector<std::vector<std::string>> buckets_keys;
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "10");
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    std::unordered_map<std::string, int64_t> offloading_objects;
+    offloading_objects.emplace("normal", 1);
+    offloading_objects.emplace("oversized", 100);  // > size limit of 10
+
+    // The oversized object is dropped immediately; the normal object stays as
+    // the partial tail.
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 1);
+
+    // Idle heartbeats must eventually flush the normal tail and never resurrect
+    // the oversized object.
+    offloading_objects.clear();
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+            fileStorage, offloading_objects, buckets_keys));
+        ASSERT_TRUE(buckets_keys.empty());
+        ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 1);
+    }
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_EQ(buckets_keys.size(), 1);
+    ASSERT_EQ(buckets_keys[0].size(), 1);
+    ASSERT_EQ(buckets_keys[0][0], "normal");
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
+}
+
+// Pins the call-chain fix: OffloadObjects() must keep driving the tail-flush
+// clock even when the master returns no new objects this cycle. Before the fix
+// it early-returned on empty input, so a partial tail bucket left by a previous
+// heartbeat never advanced toward its idle flush and stayed stuck in memory. We
+// stop one round before the flush so no real Client (nullptr here) is touched;
+// the flush itself is already covered by
+// GroupOffloadingKeysByBucket_flushes_tail_bucket.
+TEST_F(FileStorageTest, OffloadObjectsDrivesTailFlushClockOnEmptyHeartbeat) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    // Seed a sub-bucket tail. With the default 256MB bucket this one small
+    // object cannot fill a bucket, so AllocateOffloadingBuckets returns no full
+    // bucket and OffloadObjects never reaches the Client path -- safe with a
+    // nullptr client.
+    std::vector<OffloadTaskItem> seed;
+    seed.push_back(
+        OffloadTaskItem{.tenant_id = "default", .key = "k0", .size = 1});
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage, seed));
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 1);
+    ASSERT_EQ(GetTailIdleHeartbeats(fileStorage), 0);
+
+    // Each empty heartbeat must now advance the idle counter (the bug: it used
+    // to stay at 0 forever). Stop at threshold-1 (default threshold is 3) so the
+    // tail is not yet flushed and the Client is never invoked.
+    for (int64_t expected = 1; expected <= 2; ++expected) {
+        ASSERT_TRUE(FileStorageOffloadObjects(fileStorage, {}));
+        ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 1);
+        ASSERT_EQ(GetTailIdleHeartbeats(fileStorage), expected);
+    }
 }
 
 TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {

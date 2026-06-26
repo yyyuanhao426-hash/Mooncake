@@ -802,6 +802,11 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     size_t UngroupedOffloadingObjectsSize() const;
 
+    // Number of consecutive grouping rounds without new keys. Exposed for tests
+    // to assert that empty offload heartbeats keep advancing the tail-flush
+    // clock (see GroupOffloadingKeysByBucket).
+    int64_t TailIdleHeartbeats() const;
+
     /**
      * @brief Iterate over the metadata of stored objects starting from a
      * specified bucket.
