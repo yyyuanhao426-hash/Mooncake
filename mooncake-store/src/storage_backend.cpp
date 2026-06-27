@@ -1879,6 +1879,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         ++tail_idle_heartbeats_;
     }
 
+    // INFO-level trace so the tail lifecycle is observable in production
+    // (without --v=1). One line per invocation; this function is only entered
+    // when there is new work or a pending tail, so it does not spam on idle.
+    LOG(INFO) << "[OFFLOAD-GROUP] new_keys=" << new_key_count
+              << ", ungrouped=" << ungrouped_offloading_objects_.size()
+              << ", idle_heartbeats=" << tail_idle_heartbeats_ << "/"
+              << bucket_backend_config_.tail_flush_heartbeat_threshold;
+
     int64_t grouped_count = 0;
     const int64_t total_count =
         static_cast<int64_t>(ungrouped_offloading_objects_.size());
@@ -1957,9 +1965,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     if (!bucket_keys.empty() &&
         tail_idle_heartbeats_ >=
             bucket_backend_config_.tail_flush_heartbeat_threshold) {
-        VLOG(1) << "Flush partial offload bucket after idle heartbeats: "
-                << tail_idle_heartbeats_
-                << ", tail_key_count=" << bucket_keys.size();
+        LOG(INFO) << "[OFFLOAD-TAIL-FLUSH] forcing partial bucket to disk after "
+                  << tail_idle_heartbeats_ << " idle heartbeats, tail_key_count="
+                  << bucket_keys.size();
         flush_bucket();
         tail_idle_heartbeats_ = 0;
     }

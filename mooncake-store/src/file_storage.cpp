@@ -375,6 +375,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     if (offloading_objects.empty() && !has_pending_tail) {
         return {};
     }
+    if (offloading_objects.empty() && has_pending_tail) {
+        // Proves the Heartbeat -> OffloadObjects drive path runs on empty
+        // heartbeats. If this line never appears while keys still expire, the
+        // running binary predates this fix.
+        LOG(INFO) << "[OFFLOAD-DRAIN] empty heartbeat, draining pending tail, "
+                  << "ungrouped="
+                  << bucket_backend->UngroupedOffloadingObjectsSize();
+    }
     std::unordered_map<std::string, int64_t> storage_object_sizes;
     storage_object_sizes.reserve(offloading_objects.size());
     for (const auto& task : offloading_objects) {
@@ -454,6 +462,17 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 if (it != user_batch_object.end()) {
                     batch_object.emplace(storage_keys[i],
                                          std::move(it->second));
+                } else {
+                    // Grouped into this bucket but no in-memory data (e.g. the
+                    // MEMORY replica was already evicted). It will not be
+                    // written, and -- since it is already removed from the
+                    // ungrouped pool -- will surface as "Offloading task
+                    // expired" on the master. Name it so the real loss is
+                    // traceable.
+                    LOG(WARNING) << "[OFFLOAD-MISSING] grouped key has no "
+                                    "in-memory data, will not be offloaded: "
+                                    "tenant="
+                                 << tenant_id << ", key=" << user_keys[i];
                 }
             }
         }
