@@ -296,8 +296,9 @@ Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
     }
     const auto& response = result.value();
     if (response.requestId != request.requestId) {
-        return finish(Status::Error(ErrorCode::kInternal,
-                                    "Find RPC request ID mismatch"));
+        LOG(WARNING) << "Find RPC request ID mismatch"
+                     << " client_request_id=" << request.requestId
+                     << " server_request_id=" << response.requestId;
     }
     const uint64_t clientRpcNs = clientReturnNs - clientStartNs;
     const bool validHandlerTimes =
