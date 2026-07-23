@@ -1,10 +1,8 @@
 #include "emb_table/emb_table_bucket.h"
 
 #include <glog/logging.h>
-
-#include "client_service.h"
+#include <mutex>
 #include "embtable_perf.h"
-#include "replica.h"
 
 namespace embtable {
 
@@ -28,6 +26,8 @@ bool IsTerminalPublishError(const Status& status) {
            status.code() == static_cast<int>(ErrorCode::kNotSupported);
 }
 
+bool IsNetworkRpcError(const Status& status) { return status.IsNetworkError(); }
+
 }  // namespace
 
 Bucket::Bucket(BucketInfo info, std::shared_ptr<ShareMapStore> shareMapStore,
@@ -42,59 +42,36 @@ Bucket::Bucket(BucketInfo info, std::shared_ptr<ShareMapStore> shareMapStore,
       localHostname_(localHostname),
       shareMapStoreRpcPort_(shareMapStoreRpcPort) {}
 
-Status Bucket::ResolveLocality() {
-    std::lock_guard<std::mutex> localityLock(localityMutex_);
+Status Bucket::ResolveLocality(const Status* requestError) {
+    const bool rerouteRequested =
+        requestError && IsNetworkRpcError(*requestError);
+    if (requestError && !rerouteRequested) return *requestError;
+
+    std::unique_lock<std::mutex> localityLock(localityMutex_);
     const auto now = std::chrono::steady_clock::now();
-    if (localityResolved_ &&
+    if (!rerouteRequested && localityResolved_ &&
         now - localityResolvedAt_ < std::chrono::seconds(1)) {
-        return Status::OK();
-    }
-
-    std::string ownerHost;
-    bool replicaResolved = false;
-
-    // rpcEndpoint is the authoritative ShareMap owner recorded when the
-    // bucket is created. The Mooncake Store replica holding the small bucket
-    // metadata object may be placed on any node and must not override it.
-    if (!info_.rpcEndpoint.empty()) {
-        ownerHost = ExtractHostname(info_.rpcEndpoint);
-        isLocal_ = IsSameHost(ownerHost, localHostname_);
-        replicaResolved = true;
-    }
-
-    // Legacy metadata may not contain rpcEndpoint. Fall back to replica
-    // placement only for those entries.
-    if (!replicaResolved && realClient_ && realClient_->client_) {
-        auto queryResult =
-            realClient_->batch_query({bucketKey_ + "_bucketmeta"});
-        if (!queryResult.empty() && queryResult[0].has_value()) {
-            const auto& replicas = queryResult[0].value().replicas;
-            for (const auto& replica : replicas) {
-                if (realClient_->client_->IsReplicaOnLocalMemory(replica)) {
-                    isLocal_ = true;
-                    replicaResolved = true;
-                    ownerHost = localHostname_;
-                    break;
-                }
-            }
-            if (!replicaResolved) {
-                for (const auto& replica : replicas) {
-                    if (!replica.is_memory_replica()) continue;
-                    const auto& endpoint =
-                        replica.get_memory_descriptor()
-                            .buffer_descriptor.transport_endpoint_;
-                    if (!endpoint.empty()) {
-                        ownerHost = ExtractHostname(endpoint);
-                        isLocal_ = IsSameHost(ownerHost, localHostname_);
-                        replicaResolved = true;
-                        break;
-                    }
-                }
-            }
+        const auto endpoint = info_.rpcEndpoint;
+        const bool local = isLocal_;
+        localityLock.unlock();
+        if (local || endpoint.empty() || !shareMapStoreClient_) {
+            return Status::OK();
         }
+        auto endpointStatus = shareMapStoreClient_->CheckEndpoint(endpoint);
+        if (endpointStatus.IsOk()) return Status::OK();
+        LOG(WARNING) << "Bucket RPC endpoint is unavailable"
+                     << ", bucket_key=" << bucketKey_
+                     << ", endpoint=" << endpoint
+                     << ", error=" << endpointStatus.msg();
+        if (!IsNetworkRpcError(endpointStatus)) return endpointStatus;
+        // Fall through to the same endpoint selection path used after a
+        // failed request.
     }
 
-    if (!replicaResolved) {
+    // rpcEndpoint is the only authoritative ShareMap owner route. The
+    // Mooncake Store replicas holding bucket metadata may be placed on any
+    // node and must not be interpreted as ShareMap owners.
+    if (info_.rpcEndpoint.empty()) {
         // Local-only deployments have no RPC routing requirement.
         if (!shareMapStoreClient_ || shareMapStoreRpcPort_ == 0) {
             isLocal_ = true;
@@ -102,39 +79,89 @@ Status Bucket::ResolveLocality() {
             localityResolvedAt_ = now;
             return Status::OK();
         }
-        return Status::Error(ErrorCode::kNotFound,
-                             "cannot resolve bucket owner: " + bucketKey_);
+        return Status::Error(
+            ErrorCode::kInvalidArgument,
+            "bucket metadata has no ShareMapStore RPC endpoint: " + bucketKey_);
     }
 
-    if (!isLocal_) {
-        if (!info_.rpcEndpoint.empty()) {
-            const auto rpcHost = ExtractHostname(info_.rpcEndpoint);
-            if (!ownerHost.empty() && !IsSameHost(rpcHost, ownerHost)) {
-                return Status::Error(
-                    ErrorCode::kInvalidArgument,
-                    "bucket replica owner does not match persisted RPC "
-                    "endpoint: " +
-                        bucketKey_);
-            }
-        } else {
-            // Compatibility for metadata written before rpcEndpoint was
-            // persisted. New metadata must retain the owner's full endpoint;
-            // the local node's RPC port is not necessarily the owner's port.
-            if (ownerHost.empty() || shareMapStoreRpcPort_ == 0) {
-                return Status::Error(
-                    ErrorCode::kInvalidArgument,
-                    "remote bucket has no ShareMapStore RPC endpoint: " +
-                        bucketKey_);
-            }
-            info_.rpcEndpoint =
-                ownerHost + ":" + std::to_string(shareMapStoreRpcPort_);
-        }
-    } else if (info_.rpcEndpoint.empty() && shareMapStoreRpcPort_ != 0) {
-        info_.rpcEndpoint =
-            localHostname_ + ":" + std::to_string(shareMapStoreRpcPort_);
-    }
+    isLocal_ = IsSameHost(ExtractHostname(info_.rpcEndpoint), localHostname_);
     localityResolved_ = true;
     localityResolvedAt_ = now;
+    const auto endpoint = info_.rpcEndpoint;
+    const bool local = isLocal_;
+    localityLock.unlock();
+    if (!local && !endpoint.empty() && shareMapStoreClient_ &&
+        !rerouteRequested) {
+        auto endpointStatus = shareMapStoreClient_->CheckEndpoint(endpoint);
+        if (endpointStatus.IsOk()) return Status::OK();
+        LOG(WARNING) << "Bucket RPC endpoint is unavailable"
+                     << ", bucket_key=" << bucketKey_
+                     << ", endpoint=" << endpoint
+                     << ", error=" << endpointStatus.msg();
+        if (!IsNetworkRpcError(endpointStatus)) return endpointStatus;
+    }
+
+    if (local) return Status::OK();
+    if (!realClient_ || !shareMapStoreClient_ || shareMapStoreRpcPort_ == 0) {
+        return Status::Error(
+            ErrorCode::kInternal,
+            "cannot reroute bucket without RealClient and RPC client: " +
+                bucketKey_);
+    }
+
+    EmbTableMeta meta(realClient_);
+    std::string newEndpoint;
+    std::vector<std::string> excludedEndpoints{endpoint};
+    while (true) {
+        auto routeStatus = meta.SelectRandomRpcEndpoint(
+            excludedEndpoints, shareMapStoreRpcPort_, newEndpoint);
+        if (!routeStatus.IsOk()) {
+            LOG(ERROR) << "Bucket reroute failed to select endpoint"
+                       << ", bucket_key=" << bucketKey_
+                       << ", failed_endpoint=" << endpoint
+                       << ", error=" << routeStatus.msg();
+            return routeStatus;
+        }
+        auto endpointStatus = shareMapStoreClient_->CheckEndpoint(newEndpoint);
+        if (endpointStatus.IsOk()) break;
+        if (!IsNetworkRpcError(endpointStatus)) return endpointStatus;
+        LOG(WARNING) << "Selected reroute endpoint is unavailable"
+                     << ", bucket_key=" << bucketKey_
+                     << ", endpoint=" << newEndpoint
+                     << ", error=" << endpointStatus.msg();
+        excludedEndpoints.push_back(newEndpoint);
+    }
+
+    BucketInfo updated;
+    {
+        std::lock_guard<std::mutex> lock(localityMutex_);
+        updated = info_;
+    }
+    updated.rpcEndpoint = newEndpoint;
+    LOG(WARNING) << "Rerouting bucket"
+                 << ", bucket_key=" << bucketKey_
+                 << ", failed_endpoint=" << endpoint
+                 << ", new_endpoint=" << newEndpoint;
+    auto updateStatus = meta.UpdateBucketMeta(updated);
+    if (!updateStatus.IsOk()) {
+        LOG(ERROR) << "Bucket reroute failed to update metadata"
+                   << ", bucket_key=" << bucketKey_
+                   << ", new_endpoint=" << newEndpoint
+                   << ", error=" << updateStatus.msg();
+        return updateStatus;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(localityMutex_);
+        info_ = std::move(updated);
+        isLocal_ =
+            IsSameHost(ExtractHostname(info_.rpcEndpoint), localHostname_);
+        localityResolved_ = true;
+        localityResolvedAt_ = std::chrono::steady_clock::now();
+    }
+    LOG(INFO) << "Bucket reroute succeeded"
+              << ", bucket_key=" << bucketKey_
+              << ", rpc_endpoint=" << newEndpoint << ", is_local=" << IsLocal();
     return Status::OK();
 }
 
@@ -217,6 +244,18 @@ Status Bucket::Flush() {
         s = shareMapStoreClient_->Publish(endpoint, bucketKey_, valueSize, keys,
                                           views);
     }
+    if (!s.IsOk() && !local && !endpoint.empty() && IsNetworkRpcError(s)) {
+        auto rerouteStatus = ResolveLocality(&s);
+        if (rerouteStatus.IsOk()) {
+            const auto reroutedEndpoint = RpcEndpoint();
+            if (IsLocal()) {
+                s = shareMapStore_->Publish(bucketKey_, valueSize, keys, views);
+            } else if (shareMapStoreClient_) {
+                s = shareMapStoreClient_->Publish(reroutedEndpoint, bucketKey_,
+                                                  valueSize, keys, views);
+            }
+        }
+    }
     if (!s.IsOk()) {
         InvalidateLocality();
         if (IsTerminalPublishError(s)) {
@@ -268,6 +307,18 @@ Status Bucket::Find(
     // Remote query via RPC; the returned buffer is held by bufferHandles.
     s = shareMapStoreClient_->QueryData(endpoint, bucketKey_, Info().valueSize,
                                         keys, buffers, bufferHandles);
+    if (!s.IsOk() && IsNetworkRpcError(s)) {
+        auto rerouteStatus = ResolveLocality(&s);
+        if (rerouteStatus.IsOk()) {
+            if (IsLocal()) {
+                s = shareMapStore_->QueryData(bucketKey_, keys, buffers);
+            } else {
+                s = shareMapStoreClient_->QueryData(RpcEndpoint(), bucketKey_,
+                                                    Info().valueSize, keys,
+                                                    buffers, bufferHandles);
+            }
+        }
+    }
     if (!s.IsOk()) InvalidateLocality();
     point.End(s.IsOk() ? 0 : s.code());
     return s;
@@ -291,6 +342,16 @@ Status Bucket::BuildIndex() {
             "remote bucket requires ShareMapStoreClient: " + bucketKey_);
     }
     s = shareMapStoreClient_->BuildIndex(endpoint, bucketKey_);
+    if (!s.IsOk() && IsNetworkRpcError(s)) {
+        auto rerouteStatus = ResolveLocality(&s);
+        if (rerouteStatus.IsOk()) {
+            if (IsLocal()) {
+                s = shareMapStore_->BuildIndex(bucketKey_);
+            } else {
+                s = shareMapStoreClient_->BuildIndex(RpcEndpoint(), bucketKey_);
+            }
+        }
+    }
     if (!s.IsOk()) InvalidateLocality();
     return s;
 }
