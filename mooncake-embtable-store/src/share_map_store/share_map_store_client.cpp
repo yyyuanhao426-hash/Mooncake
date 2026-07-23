@@ -355,7 +355,8 @@ Status ShareMapStoreClient::QueryData(
     acquirePoint.End(rpcClient ? 0
                                : static_cast<int>(ErrorCode::kInternal));
     if (!rpcClient) {
-        return MakeRpcConnectionStatus(rpcEndpoint, connectionError);
+        return finish(
+            MakeRpcConnectionStatus(rpcEndpoint, connectionError));
     }
 
     QueryDataRequest req;
@@ -395,7 +396,8 @@ Status ShareMapStoreClient::QueryData(
     rpcPoint.End(result ? 0 : static_cast<int>(ErrorCode::kIOError));
     if (!result) {
         rpcClient->Invalidate();
-        return MakeRpcCallStatus("RPC call failed", result.error());
+        return finish(
+            MakeRpcCallStatus("RPC call failed", result.error()));
     }
     const auto& resp = result.value();
     if (resp.statusCode != 0) {
@@ -480,7 +482,8 @@ Status ShareMapStoreClient::BatchQueryData(
     acquirePoint.End(rpcClient ? 0
                                : static_cast<int>(ErrorCode::kInternal));
     if (!rpcClient) {
-        return MakeRpcConnectionStatus(rpcEndpoint, connectionError);
+        return finish(
+            MakeRpcConnectionStatus(rpcEndpoint, connectionError));
     }
 
     BatchQueryDataRequest req;
@@ -516,7 +519,8 @@ Status ShareMapStoreClient::BatchQueryData(
     rpcPoint.End(result ? 0 : static_cast<int>(ErrorCode::kIOError));
     if (!result) {
         rpcClient->Invalidate();
-        return MakeRpcCallStatus("RPC batch call failed", result.error());
+        return finish(
+            MakeRpcCallStatus("RPC batch call failed", result.error()));
     }
     const auto& resp = result.value();
     if (resp.statusCode != 0) {
