@@ -16,6 +16,7 @@
 #include <glog/logging.h>
 #include <async_simple/executors/SimpleExecutor.h>
 
+#include "default_config.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
 
@@ -99,7 +100,9 @@ Status CoroRpcAgent::start(uint16_t& port, bool ipv6) {
     const static int kMaxRetry = 10;
     if (running_)
         return Status::InvalidArgument("RPC server already started" LOC_MARK);
-    easylog::set_min_severity(easylog::Severity::FATAL);
+    // Respect MC_YLT_LOG_LEVEL instead of suppressing all non-fatal
+    // yalantinglibs logs.
+    mooncake::init_ylt_log_level();
     for (int retry = 0; retry < kMaxRetry; ++retry) {
         try {
             if (port == 0)
