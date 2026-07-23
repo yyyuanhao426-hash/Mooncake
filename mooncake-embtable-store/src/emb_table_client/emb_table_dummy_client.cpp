@@ -301,27 +301,27 @@ Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
                      << " server_request_id=" << response.requestId;
     }
     const uint64_t clientRpcNs = clientReturnNs - clientStartNs;
-    const bool validHandlerTimes =
-        response.handlerExitNs >= response.handlerEnterNs;
+    const bool validRpcTimes =
+        response.handlerEnterNs >= clientStartNs &&
+        response.handlerExitNs >= response.handlerEnterNs &&
+        clientReturnNs >= response.handlerExitNs;
+    const uint64_t clientToHandlerNs =
+        validRpcTimes ? response.handlerEnterNs - clientStartNs : 0;
     const uint64_t handlerNs =
-        validHandlerTimes
+        validRpcTimes
             ? response.handlerExitNs - response.handlerEnterNs
             : 0;
-    const uint64_t outsideHandlerNs =
-        validHandlerTimes && clientRpcNs >= handlerNs
-            ? clientRpcNs - handlerNs
-            : 0;
+    const uint64_t handlerToClientNs =
+        validRpcTimes ? clientReturnNs - response.handlerExitNs : 0;
     if (options_.slowRpcThresholdUs != 0 &&
         clientRpcNs / 1000 >= options_.slowRpcThresholdUs) {
         LOG(WARNING) << "embtable_dummy_rpc_slow"
                      << " request_id=" << request.requestId
-                     << " client_start_ns=" << clientStartNs
-                     << " handler_enter_ns=" << response.handlerEnterNs
-                     << " handler_exit_ns=" << response.handlerExitNs
-                     << " client_return_ns=" << clientReturnNs
-                     << " client_rpc_us=" << clientRpcNs / 1000
-                     << " server_handler_us=" << handlerNs / 1000
-                     << " outside_handler_us=" << outsideHandlerNs / 1000
+                     << " client_to_handler_us="
+                     << clientToHandlerNs / 1000
+                     << " handler_us=" << handlerNs / 1000
+                     << " handler_to_client_us="
+                     << handlerToClientNs / 1000
                      << " key_count=" << keys.size()
                      << " status=" << response.statusCode;
     }
