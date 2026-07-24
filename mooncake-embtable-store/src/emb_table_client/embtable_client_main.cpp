@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -34,6 +35,10 @@ DEFINE_uint32(embtable_phf_lookup_concurrency, 4,
 DEFINE_string(embtable_share_object_size, "64 MB", "Default ShareObject size");
 
 int main(int argc, char* argv[]) {
+    // embtable_client is a standalone service. It may still link libpython
+    // transitively, so explicitly enable ResourceTracker's SIGINT/SIGTERM
+    // handling before constructing the singleton.
+    setenv("MC_FORCE_SIGNAL_HANDLER", "1", /*overwrite=*/1);
     mooncake::ResourceTracker::getInstance();
     gflags::SetUsageMessage(
         "Run a multi-table EmbTable storage-node RPC service");

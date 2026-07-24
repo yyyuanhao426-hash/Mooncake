@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iostream>
@@ -365,6 +366,10 @@ void RunWorker(uint64_t worker_id, uint64_t request_count, bool continuous,
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    // This benchmark is a standalone executable. Force ResourceTracker to
+    // install its SIGINT/SIGTERM thread even if libpython is linked
+    // transitively, so Ctrl+C can print the yalanting RPC profile.
+    setenv("MC_FORCE_SIGNAL_HANDLER", "1", /*overwrite=*/1);
     mooncake::ResourceTracker::getInstance();
     gflags::SetUsageMessage(
         "Benchmark EmbTableDummyClient Find performance in a cluster");

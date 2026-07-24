@@ -13,12 +13,20 @@
 
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
+#include <cstdio>
 #include <algorithm>
 #include <cctype>
 #include <functional>
 #include <limits>
 #include <optional>
 #include <vector>
+
+#if __has_include(<ylt/coro_io/urma/urma_benchmark_profile.hpp>)
+#include <ylt/coro_io/urma/urma_benchmark_profile.hpp>
+#define MOONCAKE_HAS_YLT_URMA_BENCHMARK_PROFILE 1
+#else
+#define MOONCAKE_HAS_YLT_URMA_BENCHMARK_PROFILE 0
+#endif
 
 #include "real_client.h"
 #include "client_buffer.hpp"
@@ -467,8 +475,17 @@ ResourceTracker::ResourceTracker() {
     // startSignalThread) would prevent Python from raising KeyboardInterrupt,
     // causing the process to hang on Ctrl-C.  Detect Python at runtime via
     // dlsym so we don't need to include <Python.h> or change any public API.
-    if (!dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
-        // Standalone C/C++ process – install our own signal handling.
+    // Allow standalone executables that happen to link libpython to force
+    // signal handling.
+    bool python_detected = dlsym(RTLD_DEFAULT, "Py_IsInitialized") != nullptr;
+    const char* force = std::getenv("MC_FORCE_SIGNAL_HANDLER");
+    if (force && (std::string_view(force) == "1" ||
+                  std::string_view(force) == "on" ||
+                  std::string_view(force) == "true")) {
+        python_detected = false;
+    }
+    if (!python_detected) {
+        // Standalone C/C++ process - install our own signal handling.
         startSignalThread();
     }
 
@@ -517,7 +534,16 @@ void ResourceTracker::signalHandler(int signal) {
     raise(signal);
 }
 
-void ResourceTracker::exitHandler() { getInstance().cleanupAllResources(); }
+void ResourceTracker::exitHandler() {
+#if MOONCAKE_HAS_YLT_URMA_BENCHMARK_PROFILE
+    if (coro_io::urma_benchmark_profile::enabled()) {
+        std::fprintf(stderr, "\n=== RPC Profile (atexit path) ===\n");
+        coro_io::urma_benchmark_profile::print(std::cerr);
+        std::fflush(stderr);
+    }
+#endif
+    getInstance().cleanupAllResources();
+}
 
 void ResourceTracker::startSignalThread() {
     std::call_once(signal_once_, [this]() {
@@ -560,6 +586,17 @@ void ResourceTracker::startSignalThread() {
                 LOG(INFO) << "Received signal " << sig
                           << ", cleaning up resources";
                 ResourceTracker::getInstance().cleanupAllResources();
+
+                // The process is terminated by raise(sig), so atexit handlers
+                // will not run. Print the yalanting RPC profile here first.
+#if MOONCAKE_HAS_YLT_URMA_BENCHMARK_PROFILE
+                if (coro_io::urma_benchmark_profile::enabled()) {
+                    std::fprintf(stderr,
+                                 "\n=== RPC Profile (signal path) ===\n");
+                    coro_io::urma_benchmark_profile::print(std::cerr);
+                    std::fflush(stderr);
+                }
+#endif
 
                 // Restore default action and re-raise to terminate normally
                 struct sigaction sa;
