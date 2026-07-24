@@ -2,7 +2,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -18,6 +20,7 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <ylt/coro_io/urma/urma_benchmark_profile.hpp>
 
 #include "emb_table_client/emb_table_dummy_client.h"
 #include "utils.h"
@@ -366,6 +369,29 @@ void RunWorker(uint64_t worker_id, uint64_t request_count, bool continuous,
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    // Some yalanting worker threads unblock SIGINT/SIGTERM, so keep a
+    // process-wide handler as a fallback when ResourceTracker's sigwait thread
+    // cannot receive the signal.
+    struct sigaction sa;
+    sa.sa_handler = [](int sig) {
+        if (coro_io::urma_benchmark_profile::enabled()) {
+            std::fprintf(stderr, "\n=== RPC Profile (signal %d) ===\n", sig);
+            coro_io::urma_benchmark_profile::print(std::cerr);
+            std::fflush(stderr);
+        }
+
+        struct sigaction dfl;
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        dfl.sa_flags = 0;
+        sigaction(sig, &dfl, nullptr);
+        raise(sig);
+    };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
     // This benchmark is a standalone executable. Force ResourceTracker to
     // install its SIGINT/SIGTERM thread even if libpython is linked
     // transitively, so Ctrl+C can print the yalanting RPC profile.

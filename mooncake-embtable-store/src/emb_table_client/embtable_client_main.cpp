@@ -1,12 +1,16 @@
 #include <algorithm>
 #include <condition_variable>
+#include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <iostream>
 #include <mutex>
 #include <string>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <ylt/coro_io/urma/urma_benchmark_profile.hpp>
 
 #include "emb_table_client/emb_table_client.h"
 #include "real_client.h"
@@ -35,6 +39,29 @@ DEFINE_uint32(embtable_phf_lookup_concurrency, 4,
 DEFINE_string(embtable_share_object_size, "64 MB", "Default ShareObject size");
 
 int main(int argc, char* argv[]) {
+    // Some yalanting worker threads unblock SIGINT/SIGTERM, so keep a
+    // process-wide handler as a fallback when ResourceTracker's sigwait thread
+    // cannot receive the signal.
+    struct sigaction sa;
+    sa.sa_handler = [](int sig) {
+        if (coro_io::urma_benchmark_profile::enabled()) {
+            std::fprintf(stderr, "\n=== RPC Profile (signal %d) ===\n", sig);
+            coro_io::urma_benchmark_profile::print(std::cerr);
+            std::fflush(stderr);
+        }
+
+        struct sigaction dfl;
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        dfl.sa_flags = 0;
+        sigaction(sig, &dfl, nullptr);
+        raise(sig);
+    };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
     // embtable_client is a standalone service. It may still link libpython
     // transitively, so explicitly enable ResourceTracker's SIGINT/SIGTERM
     // handling before constructing the singleton.
