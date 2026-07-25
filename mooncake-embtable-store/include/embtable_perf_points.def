@@ -2,12 +2,14 @@
 // distort PHF lookup and memory-copy measurements.
 PERF_KEY_DEF(EMB_RD_DUMMY_FIND_TOTAL,        "EmbTableDummyClient::Find",          "FindTotal")
 PERF_KEY_DEF(EMB_RD_DUMMY_SHM_ALLOC,         "EmbTableDummyClient::Find",          "ShmBufferAlloc")
+PERF_KEY_DEF(EMB_RD_DUMMY_SHM_KEYS_COPY,     "EmbTableDummyClient::Find",          "ShmKeysCopy")
 PERF_KEY_DEF(EMB_RD_DUMMY_RPC_WAIT,          "EmbTableDummyClient::Find",          "RpcWait")
 PERF_KEY_DEF(EMB_RD_DUMMY_SHM_PARSE,         "EmbTableDummyClient::Find",          "ShmResultParse")
 
 PERF_KEY_DEF(EMB_RD_DUMMY_RPC_HANDLE_TOTAL,  "EmbTableRpcService::HandleFind",     "HandleTotal")
 PERF_KEY_DEF(EMB_RD_DUMMY_RPC_META,          "EmbTableRpcService::HandleFind",     "GetTableMeta")
 PERF_KEY_DEF(EMB_RD_DUMMY_RPC_SHM_RESOLVE,   "EmbTableRpcService::HandleFind",     "ResolveSharedMemory")
+PERF_KEY_DEF(EMB_RD_DUMMY_RPC_SHM_KEYS_LOAD, "EmbTableRpcService::HandleFind",     "LoadKeysFromSharedMemory")
 PERF_KEY_DEF(EMB_RD_DUMMY_RPC_CORE_FIND,     "EmbTableRpcService::HandleFind",     "CoreFind")
 PERF_KEY_DEF(EMB_RD_DUMMY_RPC_SHM_PACK,      "EmbTableRpcService::HandleFind",     "ShmResultPack")
 PERF_KEY_DEF(EMB_RPC_REGISTER_SHM_TOTAL,      "EmbTableRpcService",                 "HandleRegisterSharedMemory")

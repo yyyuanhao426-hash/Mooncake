@@ -8,8 +8,9 @@
 
 namespace embtable {
 
-// EmbTable RPC carries only control data. Insert values and Find results are
-// exchanged through a POSIX shared-memory region registered by DummyClient.
+// EmbTable RPC carries only control data. Insert values, Find keys, and Find
+// results are exchanged through a POSIX shared-memory region registered by
+// DummyClient.
 struct RegisterEmbTableShmRequest {
     std::string shmName;
     uint64_t shmSize = 0;
@@ -52,13 +53,14 @@ YLT_REFL(EmbTableInsertRequest, tableName, keys, shmName, dataOffset, dataSize);
 struct EmbTableFindRequest {
     uint64_t requestId = 0;
     std::string tableName;
-    std::vector<uint64_t> keys;
     std::string shmName;
+    uint64_t keysOffset = 0;
+    uint64_t keyCount = 0;
     uint64_t targetOffset = 0;
     uint64_t targetCapacity = 0;
 };
-YLT_REFL(EmbTableFindRequest, requestId, tableName, keys, shmName, targetOffset,
-         targetCapacity);
+YLT_REFL(EmbTableFindRequest, requestId, tableName, shmName, keysOffset,
+         keyCount, targetOffset, targetCapacity);
 
 struct EmbTableFindResponse {
     uint64_t requestId = 0;

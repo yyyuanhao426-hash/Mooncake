@@ -256,16 +256,20 @@ Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
 
     // Release this thread's previous result before allocating its next slot.
     gFindBuffers.erase(this);
+    uint64_t keysSize = 0;
     uint64_t targetSize = 0;
+    uint64_t allocationSize = 0;
     if (valueSize_ == std::numeric_limits<uint64_t>::max() ||
-        !CheckedMultiply(keys.size(), valueSize_ + 1, targetSize)) {
+        !CheckedMultiply(keys.size(), sizeof(uint64_t), keysSize) ||
+        !CheckedMultiply(keys.size(), valueSize_ + 1, targetSize) ||
+        !CheckedAdd(keysSize, targetSize, allocationSize)) {
         return finish(Status::Error(ErrorCode::kOutOfRange,
-                                    "Find result size overflow"));
+                                    "Find shared memory size overflow"));
     }
     UbDiag::PerfPoint allocPoint(PerfKey::EMB_RD_DUMMY_SHM_ALLOC,
                                  UbDiag::PerfLevel::MODULE);
     allocPoint.Start();
-    auto handle = AllocateSharedBuffer(targetSize);
+    auto handle = AllocateSharedBuffer(allocationSize);
     allocPoint.End(handle ? 0
                           : static_cast<int>(ErrorCode::kBufferFull));
     if (!handle) {
@@ -273,14 +277,30 @@ Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
                                     "shared memory allocator exhausted"));
     }
 
+    const uint64_t allocationOffset = static_cast<uint64_t>(
+        static_cast<char*>(handle->ptr()) - static_cast<char*>(shmBase_));
+    uint64_t targetOffset = 0;
+    if (!CheckedAdd(allocationOffset, keysSize, targetOffset) ||
+        keysSize > handle->size() ||
+        targetSize > handle->size() - keysSize) {
+        return finish(Status::Error(ErrorCode::kOutOfRange,
+                                    "Find shared memory layout is invalid"));
+    }
+
+    UbDiag::PerfPoint keysCopyPoint(PerfKey::EMB_RD_DUMMY_SHM_KEYS_COPY,
+                                    UbDiag::PerfLevel::MODULE);
+    keysCopyPoint.Start();
+    std::memcpy(handle->ptr(), keys.data(), static_cast<size_t>(keysSize));
+    keysCopyPoint.End(0);
+
     EmbTableFindRequest request;
     request.requestId = NextRequestId();
     request.tableName = options_.tableName;
-    request.keys = keys;
     request.shmName = shmName_;
-    request.targetOffset = static_cast<uint64_t>(
-        static_cast<char*>(handle->ptr()) - static_cast<char*>(shmBase_));
-    request.targetCapacity = handle->size();
+    request.keysOffset = allocationOffset;
+    request.keyCount = static_cast<uint64_t>(keys.size());
+    request.targetOffset = targetOffset;
+    request.targetCapacity = targetSize;
     UbDiag::PerfPoint rpcPoint(PerfKey::EMB_RD_DUMMY_RPC_WAIT,
                                UbDiag::PerfLevel::KEY_MODULE);
     const uint64_t clientStartNs = MonotonicNowNs();
@@ -357,7 +377,8 @@ Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
         parsePoint.End(status.code());
         return finish(status);
     }
-    const char* data = static_cast<const char*>(handle->ptr());
+    const char* data =
+        static_cast<const char*>(handle->ptr()) + keysSize;
     buffers.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         const char* entry = data + i * entrySize;

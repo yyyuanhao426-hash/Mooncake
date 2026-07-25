@@ -14,7 +14,8 @@
 namespace embtable {
 
 // User-side client for disaggregated deployment. RPC transports keys and
-// control metadata; values and query results move through shared memory.
+// control metadata; Insert values, Find keys, and Find results move through
+// shared memory.
 class EmbTableDummyClient {
    public:
     struct Options {

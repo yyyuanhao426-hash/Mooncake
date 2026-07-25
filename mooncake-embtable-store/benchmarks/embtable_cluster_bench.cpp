@@ -482,10 +482,15 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "configured value size does not match server value size";
         return 1;
     }
+    uint64_t find_keys_size = 0;
+    uint64_t find_result_size = 0;
     uint64_t find_buffer_size = 0;
     if (value_size == std::numeric_limits<uint64_t>::max() ||
+        !CheckedMultiply(FLAGS_embtable_request_keys, sizeof(uint64_t),
+                         find_keys_size) ||
         !CheckedMultiply(FLAGS_embtable_request_keys, value_size + 1,
-                         find_buffer_size) ||
+                         find_result_size) ||
+        !CheckedAdd(find_keys_size, find_result_size, find_buffer_size) ||
         find_buffer_size > shared_memory_size) {
         LOG(ERROR) << "shared memory is too small for one Find request";
         return 1;

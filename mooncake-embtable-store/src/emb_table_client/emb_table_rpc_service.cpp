@@ -230,17 +230,27 @@ EmbTableFindResponse EmbTableRpcService::HandleFind(
     }
     const uint64_t valueSize = info.dimSize;
     uint64_t entrySize = valueSize + 1;
+    uint64_t keysSize = 0;
     uint64_t requiredSize = 0;
     if (entrySize == 0 ||
-        !CheckedMultiply(req.keys.size(), entrySize, requiredSize) ||
+        !CheckedMultiply(req.keyCount, sizeof(uint64_t), keysSize) ||
+        !CheckedMultiply(req.keyCount, entrySize, requiredSize) ||
+        keysSize > std::numeric_limits<size_t>::max() ||
         req.targetCapacity < requiredSize) {
         response.statusCode = static_cast<int32_t>(ErrorCode::kOutOfRange);
-        response.errorMsg = "Find shared memory capacity is insufficient";
+        response.errorMsg = "Find shared memory size is invalid";
         totalPoint.End(response.statusCode);
         return finish();
     }
-    if (req.keys.empty()) {
+    if (req.keyCount == 0) {
         totalPoint.End(0);
+        return finish();
+    }
+    if (req.keyCount > std::numeric_limits<size_t>::max()) {
+        response.statusCode =
+            static_cast<int32_t>(ErrorCode::kOutOfRange);
+        response.errorMsg = "Find key count exceeds addressable memory";
+        totalPoint.End(response.statusCode);
         return finish();
     }
 
@@ -251,19 +261,31 @@ EmbTableFindResponse EmbTableRpcService::HandleFind(
     resolvePoint.End(mapping ? 0
                              : static_cast<int>(ErrorCode::kNotFound));
     if (!mapping ||
+        !IsRangeValid(req.keysOffset, keysSize, mapping->size) ||
         !IsRangeValid(req.targetOffset, requiredSize, mapping->size)) {
         response.statusCode = static_cast<int32_t>(ErrorCode::kOutOfRange);
-        response.errorMsg = "Find shared memory range is invalid";
+        response.errorMsg =
+            "Find keys or result shared memory range is invalid";
         totalPoint.End(response.statusCode);
         return finish();
     }
+
+    UbDiag::PerfPoint keysLoadPoint(
+        PerfKey::EMB_RD_DUMMY_RPC_SHM_KEYS_LOAD,
+        UbDiag::PerfLevel::MODULE);
+    keysLoadPoint.Start();
+    std::vector<uint64_t> keys(static_cast<size_t>(req.keyCount));
+    std::memcpy(keys.data(),
+                static_cast<const char*>(mapping->base) + req.keysOffset,
+                static_cast<size_t>(keysSize));
+    keysLoadPoint.End(0);
 
     std::vector<StringView> values;
     std::vector<std::shared_ptr<mooncake::BufferHandle>> handles;
     UbDiag::PerfPoint findPoint(PerfKey::EMB_RD_DUMMY_RPC_CORE_FIND,
                                 UbDiag::PerfLevel::KEY_MODULE);
     findPoint.Start();
-    Status status = client_.Find(req.tableName, req.keys, values, handles);
+    Status status = client_.Find(req.tableName, keys, values, handles);
     findPoint.End(status.IsOk() ? 0 : status.code());
     if (!status.IsOk()) {
         response.statusCode = status.code();
@@ -276,7 +298,7 @@ EmbTableFindResponse EmbTableRpcService::HandleFind(
                                 UbDiag::PerfLevel::MODULE);
     packPoint.Start();
     char* target = static_cast<char*>(mapping->base) + req.targetOffset;
-    for (size_t i = 0; i < req.keys.size(); ++i) {
+    for (size_t i = 0; i < keys.size(); ++i) {
         char* entry = target + i * entrySize;
         if (i < values.size() && values[i].data() &&
             values[i].size() >= valueSize) {
