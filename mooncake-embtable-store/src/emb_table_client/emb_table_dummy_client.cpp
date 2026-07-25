@@ -92,11 +92,11 @@ Status EmbTableDummyClient::Init() {
     rpcClient_ = std::make_unique<coro_rpc::coro_rpc_client>();
 
     // coro_rpc_client 配置方式：
-    coro_rpc_client::config config;
+    coro_rpc::coro_rpc_client::config config;
     // TCP 配置（默认）
-    config.socket_config = coro_rpc_client::tcp_config{};
+    config.socket_config = coro_rpc::coro_rpc_client::tcp_config{};
     // 关闭 TCP_NODELAY
-    std::get<coro_rpc_client::tcp_config>(config.socket_config).enable_tcp_no_delay = false;
+    std::get<coro_rpc::coro_rpc_client::tcp_config>(config.socket_config).enable_tcp_no_delay = false;
 
     // 或者直接构造时指定
     rpcClient_->init_config(config);
