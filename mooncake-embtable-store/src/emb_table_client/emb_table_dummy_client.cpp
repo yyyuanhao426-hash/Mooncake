@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
@@ -18,6 +19,8 @@
 namespace embtable {
 
 namespace {
+
+constexpr auto kBuildIndexRpcTimeout = std::chrono::minutes(10);
 
 std::atomic<uint64_t> gSharedMemorySequence{0};
 
@@ -328,7 +331,8 @@ Status EmbTableDummyClient::BuildIndex() {
     EmbTableBuildIndexRequest request;
     request.tableName = options_.tableName;
     auto result = async_simple::coro::syncAwait(
-        rpcClient_->call<&EmbTableRpcService::HandleBuildIndex>(request));
+        rpcClient_->call_for<&EmbTableRpcService::HandleBuildIndex>(
+            kBuildIndexRpcTimeout, request));
     if (!result) {
         return Status::Error(ErrorCode::kIOError,
                              "BuildIndex RPC failed: " + result.error().msg);

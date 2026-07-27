@@ -62,9 +62,10 @@ class Status {
     // Transport-level error returned by an RPC client. This remains encoded
     // as kIOError for compatibility with the existing RPC status wire format,
     // while callers can distinguish it from storage and application errors.
-    static Status NetworkError(std::string msg) {
+    static Status NetworkError(std::string msg, bool timedOut = false) {
         Status status(ErrorCode::kIOError, std::move(msg));
         status.networkError_ = true;
+        status.timedOut_ = timedOut;
         return status;
     }
 
@@ -73,6 +74,7 @@ class Status {
     int code() const { return code_; }
     const std::string& msg() const { return msg_; }
     bool IsNetworkError() const { return networkError_; }
+    bool IsTimedOut() const { return timedOut_; }
 
     // Allow `if (status)` idiom.
     explicit operator bool() const { return IsOk(); }
@@ -81,6 +83,7 @@ class Status {
     int code_ = 0;
     std::string msg_;
     bool networkError_ = false;
+    bool timedOut_ = false;
 };
 
 // Hash function selector (design doc section 8.4)

@@ -1,6 +1,7 @@
 #include "share_map_store/share_map_store_client.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -15,6 +16,8 @@
 namespace embtable {
 
 namespace {
+
+constexpr auto kBuildIndexRpcTimeout = std::chrono::minutes(10);
 
 Status FromRemoteStatus(int32_t statusCode, const std::string& operation,
                         const std::string& message) {
@@ -40,7 +43,9 @@ Status MakeRpcConnectionStatus(const std::string& rpcEndpoint,
     const auto message =
         "RPC client connect failed: " + rpcEndpoint +
         ", error=" + std::string(coro_rpc::make_error_message(code));
-    if (IsNetworkRpcCode(code)) return Status::NetworkError(message);
+    if (IsNetworkRpcCode(code)) {
+        return Status::NetworkError(message, code == coro_rpc::errc::timed_out);
+    }
     return Status::Error(ErrorCode::kInternal, message);
 }
 
@@ -48,7 +53,9 @@ Status MakeRpcCallStatus(const std::string& operation,
                          const coro_rpc::rpc_error& error) {
     const auto code = static_cast<coro_rpc::errc>(error.code);
     const auto message = operation + ": " + error.msg;
-    if (IsNetworkRpcCode(code)) return Status::NetworkError(message);
+    if (IsNetworkRpcCode(code)) {
+        return Status::NetworkError(message, code == coro_rpc::errc::timed_out);
+    }
     return Status::Error(ErrorCode::kInternal, message);
 }
 
@@ -640,8 +647,9 @@ Status ShareMapStoreClient::BuildIndex(const std::string& rpcEndpoint,
     req.bucketKey = bucketKey;
 
     auto result = async_simple::coro::syncAwait(
-        rpcClient->get()->call<&ShareMapStoreRpcService::HandleBuildIndex>(
-            req));
+        rpcClient->get()
+            ->call_for<&ShareMapStoreRpcService::HandleBuildIndex>(
+                kBuildIndexRpcTimeout, req));
     if (!result) {
         rpcClient->Invalidate();
         return MakeRpcCallStatus("RPC call failed", result.error());

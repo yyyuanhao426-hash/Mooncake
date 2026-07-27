@@ -345,7 +345,12 @@ Status Bucket::BuildIndex() {
             "remote bucket requires ShareMapStoreClient: " + bucketKey_);
     }
     s = shareMapStoreClient_->BuildIndex(endpoint, bucketKey_);
-    if (!s.IsOk() && IsNetworkRpcError(s)) {
+    // BuildIndex is a long-running, non-idempotent operation. A request
+    // timeout only means that the response did not arrive before the
+    // deadline; the remote node may still be building or may already have
+    // published the index. Do not change bucket ownership or issue a second
+    // BuildIndex in that case.
+    if (!s.IsOk() && IsNetworkRpcError(s) && !s.IsTimedOut()) {
         auto rerouteStatus = ResolveLocality(&s);
         if (rerouteStatus.IsOk()) {
             if (IsLocal()) {
