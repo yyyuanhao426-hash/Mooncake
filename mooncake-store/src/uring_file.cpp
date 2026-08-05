@@ -172,6 +172,46 @@ class SharedUringRing {
         return total;
     }
 
+    // Like batch_read, but each desc carries its own fd, so reads to DIFFERENT
+    // files overlap in one submission. Returns the total bytes read.
+    struct MultiReadDesc {
+        int fd;
+        void* buf;
+        size_t len;
+        off_t off;
+    };
+    tl::expected<size_t, ErrorCode> batch_read_multi(const MultiReadDesc* descs,
+                                                     int cnt) {
+        ensure_buf_registered();
+        size_t total = 0;
+        int remaining = cnt;
+        int idx = 0;
+
+        while (remaining > 0) {
+            int batch = std::min(remaining, static_cast<int>(QUEUE_DEPTH));
+
+            for (int i = 0; i < batch; ++i) {
+                struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+                if (!sqe) {
+                    LOG(ERROR) << "[SharedUringRing] SQ full (batch_read_multi)";
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                const auto& d = descs[idx + i];
+                if (buf_registered_ && in_registered_buf(d.buf, d.len))
+                    io_uring_prep_read_fixed(sqe, d.fd, d.buf, d.len, d.off, 0);
+                else
+                    io_uring_prep_read(sqe, d.fd, d.buf, d.len, d.off);
+            }
+
+            auto res = collect(batch);
+            if (!res) return res;
+            total += res.value();
+            idx += batch;
+            remaining -= batch;
+        }
+        return total;
+    }
+
     /// Issue IORING_FSYNC_DATASYNC.  Blocks until complete.
     tl::expected<void, ErrorCode> fsync(int fd) {
         if (!initialized_)
@@ -586,6 +626,20 @@ tl::expected<size_t, ErrorCode> UringFile::batch_read(const ReadDesc* descs,
     const auto* ring_descs =
         reinterpret_cast<const SharedUringRing::ReadDesc*>(descs);
     return SharedUringRing::instance().batch_read(fd_, ring_descs, cnt);
+}
+
+// static — operates on the calling thread's ring; each desc carries its own fd.
+tl::expected<size_t, ErrorCode> UringFile::batch_read_multi(
+    const MultiReadDesc* descs, int cnt) {
+    if (!descs || cnt <= 0)
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
+
+    static_assert(
+        sizeof(MultiReadDesc) == sizeof(SharedUringRing::MultiReadDesc),
+        "MultiReadDesc layout mismatch");
+    const auto* ring_descs =
+        reinterpret_cast<const SharedUringRing::MultiReadDesc*>(descs);
+    return SharedUringRing::instance().batch_read_multi(ring_descs, cnt);
 }
 
 // ---------------------------------------------------------------------------

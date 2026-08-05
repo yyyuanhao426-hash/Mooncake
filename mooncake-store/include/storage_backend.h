@@ -234,6 +234,12 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // Cross-bucket multi-fd io_uring batch read for offload BatchLoad: submit
+    // reads spanning DIFFERENT bucket files in one ring submission so they
+    // overlap (NVMe queue depth > 1) even when keys scatter ~1-per-bucket.
+    // Requires use_uring. Default off — falls back to per-key read_aligned.
+    bool uring_batch = false;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 

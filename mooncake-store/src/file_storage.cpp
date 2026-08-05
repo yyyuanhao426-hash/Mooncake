@@ -99,6 +99,13 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
                        GetEnvStringOr("MOONCAKE_USE_URING", "false"));
     config.use_uring = (use_uring_str == "true" || use_uring_str == "1");
 
+    // Cross-bucket multi-fd batch read (default off). Only effective together
+    // with use_uring.
+    auto uring_batch_str =
+        GetEnvStringOr("MOONCAKE_OFFLOAD_URING_BATCH", "false");
+    config.uring_batch =
+        (uring_batch_str == "true" || uring_batch_str == "1");
+
     return config;
 }
 

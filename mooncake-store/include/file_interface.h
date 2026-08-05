@@ -149,6 +149,11 @@ class StorageFile {
      */
     ErrorCode get_error_code() { return error_code_; }
 
+    /**
+     * @brief Returns the underlying file descriptor (for multi-fd batch I/O).
+     */
+    int fd() const { return fd_; }
+
    protected:
     std::string filename_;
     int fd_;
@@ -216,6 +221,20 @@ class UringFile : public StorageFile {
         off_t off;
     };
     tl::expected<size_t, ErrorCode> batch_read(const ReadDesc *descs, int cnt);
+
+    // Multi-fd batch read: like batch_read but each desc names its own fd, so
+    // reads spanning DIFFERENT files (e.g. different bucket files) overlap in
+    // one ring submission. Static — operates on the calling thread's ring and
+    // raw fds, not a single UringFile instance. Callers must keep the fds open
+    // until this returns and (under O_DIRECT) pass 4096-aligned buf/len/off.
+    struct MultiReadDesc {
+        int fd;
+        void *buf;
+        size_t len;
+        off_t off;
+    };
+    static tl::expected<size_t, ErrorCode> batch_read_multi(
+        const MultiReadDesc *descs, int cnt);
 
     // Flush data to stable storage via IORING_FSYNC_DATASYNC.
     // Must be called after write_aligned and before writing dependent metadata.

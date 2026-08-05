@@ -1459,6 +1459,88 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     // which remain alive until this function returns (~line bucket_guards
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
 
+#ifdef USE_URING
+    // Optional cross-bucket multi-fd batch path (MOONCAKE_OFFLOAD_URING_BATCH).
+    // Opens every bucket file, builds ONE global desc list across all buckets,
+    // and submits it in a single io_uring submission so reads to different
+    // bucket files overlap — unlike the default per-bucket loop below, this
+    // gives queue depth > 1 even when the batch's keys scatter ~1-per-bucket.
+    if (file_storage_config_.use_uring && file_storage_config_.uring_batch) {
+        std::vector<std::unique_ptr<StorageFile>> open_files;  // keep fds alive
+        std::vector<UringFile::MultiReadDesc> descs;
+        struct FixupInfo {
+            const std::string* key;
+            void* base;
+            int64_t off_in_buf;
+        };
+        std::vector<FixupInfo> fixups;
+        size_t needed_total = 0;
+
+        for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+            auto filepath_res = GetBucketDataPath(bucket_id);
+            if (!filepath_res) {
+                LOG(ERROR) << "Failed to get bucket data path, bucket_id="
+                           << bucket_id;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            auto file_res = OpenFile(filepath_res.value(), FileMode::Read);
+            if (!file_res) {
+                LOG(ERROR) << "Failed to open bucket file: "
+                           << filepath_res.value();
+                return tl::make_unexpected(file_res.error());
+            }
+            int fd = file_res.value()->fd();
+            open_files.push_back(std::move(file_res.value()));
+            for (auto& plan : read_plans) {
+                // Same O_DIRECT alignment math as read_aligned; dest_slice.ptr
+                // is 4096-aligned and oversized (AllocateBatch).
+                int64_t actual_offset = plan.offset + plan.key_size;
+                int64_t aligned_offset =
+                    align_down(actual_offset, kDirectIOAlignment);
+                int64_t data_end =
+                    actual_offset + static_cast<int64_t>(plan.dest_slice.size);
+                int64_t aligned_end = static_cast<int64_t>(align_up(
+                    static_cast<size_t>(data_end), kDirectIOAlignment));
+                size_t aligned_size =
+                    static_cast<size_t>(aligned_end - aligned_offset);
+                int64_t offset_in_buffer = actual_offset - aligned_offset;
+                descs.push_back({fd, plan.dest_slice.ptr, aligned_size,
+                                 static_cast<off_t>(aligned_offset)});
+                fixups.push_back(
+                    {&plan.key, plan.dest_slice.ptr, offset_in_buffer});
+                needed_total += static_cast<size_t>(offset_in_buffer) +
+                                plan.dest_slice.size;
+            }
+        }
+
+        // One submission for ALL keys across ALL buckets (queue depth > 1).
+        UbDiag::PerfPoint pt_uring(PerfKey::GET_SSD_OWNER_LOAD_URING,
+                                   UbDiag::PerfLevel::MODULE);
+        pt_uring.Start();
+        auto read_res = UringFile::batch_read_multi(
+            descs.data(), static_cast<int>(descs.size()));
+        pt_uring.End(read_res ? 0 : -1);
+        if (!read_res) {
+            LOG(ERROR) << "batch_read_multi failed, error: " << read_res.error();
+            return tl::make_unexpected(read_res.error());
+        }
+        // Floor-check: the trailing O_DIRECT padding of the last object in each
+        // bucket file may be short at EOF (data files aren't 4096-padded); the
+        // actual data always lies before EOF.
+        if (read_res.value() < needed_total) {
+            LOG(ERROR) << "batch_read_multi short read, needed at least: "
+                       << needed_total << ", got: " << read_res.value();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        // Adjust each key's ptr to actual data start (no memcpy).
+        for (const auto& fx : fixups) {
+            batch_object.at(*fx.key).ptr =
+                static_cast<char*>(fx.base) + fx.off_in_buf;
+        }
+        return {};
+    }
+#endif
+
     // Step 2: Perform IO without holding any locks
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
         // Open file for this bucket (cheap syscall, no lock needed)
