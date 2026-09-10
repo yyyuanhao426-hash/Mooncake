@@ -17,7 +17,7 @@ def load(path: Path, expected_scheduling: bool) -> list[dict]:
             if not line.strip():
                 continue
             record = json.loads(line)
-            if record.get("schema_version") != 1:
+            if record.get("schema_version") != 2:
                 raise ValueError(f"{path}:{line_number}: unsupported schema")
             if record.get("scheduling") is not expected_scheduling:
                 raise ValueError(
@@ -33,12 +33,35 @@ def median(records: list[dict], key: str) -> float:
     return statistics.median(float(record[key]) for record in records)
 
 
-def class_p99(records: list[dict]) -> dict[str, float]:
-    values: dict[str, list[float]] = {}
+def class_medians(records: list[dict]) -> dict[str, dict[str, float]]:
+    values: dict[str, dict[str, list[float]]] = {}
     for record in records:
         for traffic in record["classes"]:
-            values.setdefault(traffic["name"], []).append(traffic["p99_us"])
-    return {name: statistics.median(samples) for name, samples in values.items()}
+            samples = values.setdefault(
+                traffic["name"],
+                {"avg_us": [], "p99_us": [], "throughput_gbps": []},
+            )
+            for metric in samples:
+                samples[metric].append(float(traffic[metric]))
+    return {
+        name: {
+            metric: statistics.median(samples)
+            for metric, samples in metrics.items()
+        }
+        for name, metrics in values.items()
+    }
+
+
+def reduction(before: float, after: float, description: str) -> float:
+    if before <= 0:
+        raise ValueError(f"baseline {description} must be positive")
+    return (before - after) / before * 100.0
+
+
+def retention(before: float, after: float, description: str) -> float:
+    if before <= 0:
+        raise ValueError(f"baseline {description} must be positive")
+    return after / before * 100.0
 
 
 def main() -> int:
@@ -61,37 +84,58 @@ def main() -> int:
             or baseline_protocols != scheduled_protocols
         ):
             raise ValueError("baseline and scheduled protocols differ")
-        baseline_p99 = class_p99(baseline)
-        scheduled_p99 = class_p99(scheduled)
-        if baseline_p99.keys() != scheduled_p99.keys():
+        baseline_classes = class_medians(baseline)
+        scheduled_classes = class_medians(scheduled)
+        if baseline_classes.keys() != scheduled_classes.keys():
             raise ValueError("traffic class sets differ")
 
         baseline_bw = median(baseline, "aggregate_throughput_gbps")
         scheduled_bw = median(scheduled, "aggregate_throughput_gbps")
-        if baseline_bw <= 0:
-            raise ValueError("baseline throughput must be positive")
-        retention = scheduled_bw / baseline_bw * 100.0
-        passed = retention >= args.min_throughput_retention
+        total_retention = retention(
+            baseline_bw, scheduled_bw, "aggregate throughput"
+        )
+        passed = total_retention >= args.min_throughput_retention
 
         print(f"protocol: {next(iter(baseline_protocols))}")
-        print("class                 baseline p99   scheduled p99   reduction")
-        for name in baseline_p99:
-            if baseline_p99[name] <= 0:
-                raise ValueError(f"baseline P99 for {name} must be positive")
-            reduction = (
-                (baseline_p99[name] - scheduled_p99[name])
-                / baseline_p99[name]
-                * 100.0
+        for name, baseline_metrics in baseline_classes.items():
+            scheduled_metrics = scheduled_classes[name]
+            avg_reduction = reduction(
+                baseline_metrics["avg_us"],
+                scheduled_metrics["avg_us"],
+                f"Avg for {name}",
+            )
+            p99_reduction = reduction(
+                baseline_metrics["p99_us"],
+                scheduled_metrics["p99_us"],
+                f"P99 for {name}",
+            )
+            bandwidth_retention = retention(
+                baseline_metrics["throughput_gbps"],
+                scheduled_metrics["throughput_gbps"],
+                f"bandwidth for {name}",
+            )
+            print(name)
+            print(
+                f"  Avg:       {baseline_metrics['avg_us']:.2f} -> "
+                f"{scheduled_metrics['avg_us']:.2f} us "
+                f"({avg_reduction:.2f}% reduction)"
             )
             print(
-                f"{name:<21} {baseline_p99[name]:>10.2f} us"
-                f" {scheduled_p99[name]:>12.2f} us {reduction:>10.2f}%"
+                f"  P99:       {baseline_metrics['p99_us']:.2f} -> "
+                f"{scheduled_metrics['p99_us']:.2f} us "
+                f"({p99_reduction:.2f}% reduction)"
+            )
+            print(
+                "  Bandwidth: "
+                f"{baseline_metrics['throughput_gbps']:.6f} -> "
+                f"{scheduled_metrics['throughput_gbps']:.6f} GB/s "
+                f"({bandwidth_retention:.2f}% retained)"
             )
             if name.startswith("foreground-"):
-                passed = passed and reduction >= args.min_p99_reduction
+                passed = passed and p99_reduction >= args.min_p99_reduction
         print(
             f"aggregate throughput: {baseline_bw:.6f} -> "
-            f"{scheduled_bw:.6f} GB/s ({retention:.2f}% retained)"
+            f"{scheduled_bw:.6f} GB/s ({total_retention:.2f}% retained)"
         )
         print("result: " + ("PASS" if passed else "FAIL"))
         return 0 if passed else 1

@@ -6,6 +6,8 @@
 #include <numa.h>
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -14,7 +16,9 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -55,6 +59,8 @@ DEFINE_uint64(scheduler_reserved_high_bytes, 1ULL << 20,
               "Scheduler bytes reserved for HIGH traffic");
 DEFINE_uint32(scheduler_max_slices, 32,
               "Scheduler maximum transport slices per grant");
+DEFINE_string(scheduler_class_weights, "8:4:1",
+              "Scheduler class weights in HIGH:MEDIUM:LOW order");
 
 namespace {
 
@@ -76,11 +82,56 @@ struct WorkerResult {
     double duration_seconds{0};
 };
 
+struct LatencyMetrics {
+    double average_us{0};
+    double min_us{0};
+    double p50_us{0};
+    double p99_us{0};
+    double p999_us{0};
+    double p9999_us{0};
+    double max_us{0};
+};
+
 void check(const mooncake::Status& status, const char* operation) {
     LOG_ASSERT(status.ok()) << operation << " failed: " << status.ToString();
 }
 
 void stopTarget(int) { target_running = 0; }
+
+std::array<uint32_t, 3> parseClassWeights() {
+    const std::string_view text = FLAGS_scheduler_class_weights;
+    const size_t first_separator = text.find(':');
+    const size_t second_separator =
+        first_separator == std::string_view::npos
+            ? std::string_view::npos
+            : text.find(':', first_separator + 1);
+    LOG_ASSERT(first_separator != std::string_view::npos &&
+               second_separator != std::string_view::npos &&
+               text.find(':', second_separator + 1) == std::string_view::npos)
+        << "--scheduler_class_weights must be HIGH:MEDIUM:LOW, for example "
+           "8:4:1";
+
+    const std::array<std::string_view, 3> tokens = {
+        text.substr(0, first_separator),
+        text.substr(first_separator + 1,
+                    second_separator - first_separator - 1),
+        text.substr(second_separator + 1),
+    };
+    std::array<uint32_t, 3> weights{};
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        uint64_t value = 0;
+        const auto parsed = std::from_chars(
+            tokens[i].data(), tokens[i].data() + tokens[i].size(), value);
+        LOG_ASSERT(parsed.ec == std::errc() &&
+                   parsed.ptr == tokens[i].data() + tokens[i].size() &&
+                   value > 0 &&
+                   value <= std::numeric_limits<uint32_t>::max())
+            << "--scheduler_class_weights entries must be positive uint32 "
+               "values";
+        weights[i] = static_cast<uint32_t>(value);
+    }
+    return weights;
+}
 
 std::string topologyJson() {
     std::string devices;
@@ -116,14 +167,28 @@ void installSelectedTransport(mooncake::TransferEngine& engine) {
         << FLAGS_protocol << " Transport installation failed";
 }
 
-double percentile(std::vector<double> samples, double value) {
-    if (samples.empty()) return 0.0;
-    std::sort(samples.begin(), samples.end());
-    const double rank = value / 100.0 * (samples.size() - 1);
+double percentile(const std::vector<double>& sorted, double value) {
+    if (sorted.empty()) return 0.0;
+    const double rank = value / 100.0 * (sorted.size() - 1);
     const size_t lower = static_cast<size_t>(rank);
-    const size_t upper = std::min(lower + 1, samples.size() - 1);
+    const size_t upper = std::min(lower + 1, sorted.size() - 1);
     const double fraction = rank - lower;
-    return samples[lower] * (1.0 - fraction) + samples[upper] * fraction;
+    return sorted[lower] * (1.0 - fraction) + sorted[upper] * fraction;
+}
+
+LatencyMetrics summarizeLatency(std::vector<double> samples) {
+    if (samples.empty()) return {};
+    const double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
+    std::sort(samples.begin(), samples.end());
+    return {
+        sum / samples.size(),
+        samples.front(),
+        percentile(samples, 50.0),
+        percentile(samples, 99.0),
+        percentile(samples, 99.9),
+        percentile(samples, 99.99),
+        samples.back(),
+    };
 }
 
 double runTransfer(mooncake::TransferEngine& engine, mooncake::SegmentID target,
@@ -196,40 +261,42 @@ void runWorker(mooncake::TransferEngine& engine, mooncake::SegmentID target,
 
 void appendRecord(const std::vector<TrafficClass>& classes,
                   const std::vector<std::vector<WorkerResult>>& results,
+                  const std::array<uint32_t, 3>& class_weights,
                   int repetition) {
     std::ofstream output(FLAGS_output_jsonl, std::ios::app);
     LOG_ASSERT(output) << "cannot open " << FLAGS_output_jsonl;
 
     double aggregate_throughput = 0.0;
     struct ClassMetrics {
-        double p99_us;
+        LatencyMetrics latency;
         double throughput_gbps;
         uint64_t operations;
     };
     std::vector<ClassMetrics> metrics;
     for (size_t class_index = 0; class_index < classes.size(); ++class_index) {
         std::vector<double> latencies;
-        uint64_t bytes = 0;
         uint64_t operations = 0;
         double throughput = 0.0;
         for (const auto& worker : results[class_index]) {
             latencies.insert(latencies.end(), worker.latency_us.begin(),
                              worker.latency_us.end());
-            bytes += worker.bytes;
             operations += worker.latency_us.size();
             if (worker.duration_seconds > 0)
                 throughput += worker.bytes / 1e9 / worker.duration_seconds;
         }
         aggregate_throughput += throughput;
         metrics.push_back(
-            {percentile(std::move(latencies), 99.0), throughput, operations});
+            {summarizeLatency(std::move(latencies)), throughput, operations});
     }
 
     output << std::fixed << std::setprecision(6)
-           << "{\"schema_version\":1,\"scheduling\":"
+           << "{\"schema_version\":2,\"scheduling\":"
            << (FLAGS_scheduling ? "true" : "false")
            << ",\"protocol\":\"" << FLAGS_protocol << "\""
            << ",\"repetition\":" << repetition
+           << ",\"class_weights\":{\"high\":" << class_weights[0]
+           << ",\"medium\":" << class_weights[1]
+           << ",\"low\":" << class_weights[2] << '}'
            << ",\"aggregate_throughput_gbps\":" << aggregate_throughput
            << ",\"classes\":[";
     for (size_t i = 0; i < classes.size(); ++i) {
@@ -238,7 +305,13 @@ void appendRecord(const std::vector<TrafficClass>& classes,
                << "\",\"threads\":" << classes[i].threads
                << ",\"block_size\":" << classes[i].block_size
                << ",\"operations\":" << metrics[i].operations
-               << ",\"p99_us\":" << metrics[i].p99_us
+               << ",\"avg_us\":" << metrics[i].latency.average_us
+               << ",\"min_us\":" << metrics[i].latency.min_us
+               << ",\"p50_us\":" << metrics[i].latency.p50_us
+               << ",\"p99_us\":" << metrics[i].latency.p99_us
+               << ",\"p999_us\":" << metrics[i].latency.p999_us
+               << ",\"p9999_us\":" << metrics[i].latency.p9999_us
+               << ",\"max_us\":" << metrics[i].latency.max_us
                << ",\"throughput_gbps\":" << metrics[i].throughput_gbps << '}';
     }
     output << "]}\n";
@@ -246,12 +319,21 @@ void appendRecord(const std::vector<TrafficClass>& classes,
 
     std::cout << "repetition=" << repetition << " scheduling=" << std::boolalpha
               << FLAGS_scheduling
+              << " class_weights=" << class_weights[0] << ':'
+              << class_weights[1] << ':' << class_weights[2]
               << " aggregate_throughput=" << aggregate_throughput << " GB/s"
               << std::endl;
     for (size_t i = 0; i < classes.size(); ++i)
-        std::cout << "  " << classes[i].name << ": p99=" << metrics[i].p99_us
-                  << " us throughput=" << metrics[i].throughput_gbps << " GB/s"
-                  << std::endl;
+        std::cout << "  " << classes[i].name
+                  << ": avg=" << metrics[i].latency.average_us
+                  << " us min=" << metrics[i].latency.min_us
+                  << " us p50=" << metrics[i].latency.p50_us
+                  << " us p99=" << metrics[i].latency.p99_us
+                  << " us p999=" << metrics[i].latency.p999_us
+                  << " us p9999=" << metrics[i].latency.p9999_us
+                  << " us max=" << metrics[i].latency.max_us
+                  << " us throughput=" << metrics[i].throughput_gbps
+                  << " GB/s operations=" << metrics[i].operations << std::endl;
 }
 
 }  // namespace
@@ -273,6 +355,7 @@ int main(int argc, char** argv) {
         << "thread counts must not exceed 128 per traffic class";
     LOG_ASSERT(FLAGS_warmup_seconds >= 0 && FLAGS_duration_seconds > 0 &&
                FLAGS_repetitions > 0);
+    const auto class_weights = parseClassWeights();
 
     std::vector<TrafficClass> classes = {
         {"foreground-4k", 4ULL << 10, FLAGS_foreground_threads,
@@ -332,6 +415,7 @@ int main(int argc, char** argv) {
         config.max_inflight_bytes = FLAGS_scheduler_max_inflight_bytes;
         config.reserved_high_bytes = FLAGS_scheduler_reserved_high_bytes;
         config.max_slices = FLAGS_scheduler_max_slices;
+        config.class_weights = class_weights;
         check(engine.configureScheduling(config), "configureScheduling");
     }
 
@@ -367,7 +451,7 @@ int main(int argc, char** argv) {
             }
         }
         for (auto& worker : workers) worker.join();
-        appendRecord(classes, results, repetition);
+        appendRecord(classes, results, class_weights, repetition);
     }
 
     engine.closeSegment(target);
