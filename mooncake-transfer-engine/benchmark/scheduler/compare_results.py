@@ -54,6 +54,13 @@ def main() -> int:
         scheduled = load(args.scheduled, True)
         if len(baseline) != len(scheduled):
             raise ValueError("run counts differ")
+        baseline_protocols = {record["protocol"] for record in baseline}
+        scheduled_protocols = {record["protocol"] for record in scheduled}
+        if (
+            len(baseline_protocols) != 1
+            or baseline_protocols != scheduled_protocols
+        ):
+            raise ValueError("baseline and scheduled protocols differ")
         baseline_p99 = class_p99(baseline)
         scheduled_p99 = class_p99(scheduled)
         if baseline_p99.keys() != scheduled_p99.keys():
@@ -66,6 +73,7 @@ def main() -> int:
         retention = scheduled_bw / baseline_bw * 100.0
         passed = retention >= args.min_throughput_retention
 
+        print(f"protocol: {next(iter(baseline_protocols))}")
         print("class                 baseline p99   scheduled p99   reduction")
         for name in baseline_p99:
             if baseline_p99[name] <= 0:

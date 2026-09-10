@@ -3,11 +3,12 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <numa.h>
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
-#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -23,11 +24,16 @@
 #include "scheduler/scheduler_policy.h"
 #include "transfer_engine.h"
 
-DEFINE_string(target_seg_name, "", "Target segment printed by tebench");
+DEFINE_string(mode, "initiator", "Benchmark role: target or initiator");
+DEFINE_string(protocol, "ub", "Transport protocol: ub, rdma, or tcp");
+DEFINE_string(device_name, "urma0",
+              "Comma-separated devices for UB/RDMA, e.g. urma0,urma1");
+DEFINE_int32(numa_node, 0, "NUMA node used for the registered buffer");
+DEFINE_string(target_seg_name, "", "Segment printed by the target process");
 DEFINE_string(metadata_conn_string, "P2PHANDSHAKE",
               "Metadata connection string");
 DEFINE_string(local_server_name, mooncake::getHostname(),
-              "Local server name used by the initiator");
+              "Local server name used for P2P discovery");
 DEFINE_bool(scheduling, false, "Submit through the classic TE scheduler");
 DEFINE_uint64(buffer_size, 1ULL << 30,
               "Registered initiator buffer size in bytes");
@@ -53,6 +59,7 @@ DEFINE_uint32(scheduler_max_slices, 32,
 namespace {
 
 using Clock = std::chrono::steady_clock;
+volatile std::sig_atomic_t target_running = 1;
 
 struct TrafficClass {
     const char* name;
@@ -71,6 +78,42 @@ struct WorkerResult {
 
 void check(const mooncake::Status& status, const char* operation) {
     LOG_ASSERT(status.ok()) << operation << " failed: " << status.ToString();
+}
+
+void stopTarget(int) { target_running = 0; }
+
+std::string topologyJson() {
+    std::string devices;
+    size_t begin = 0;
+    while (begin < FLAGS_device_name.size()) {
+        const size_t comma = FLAGS_device_name.find(',', begin);
+        const std::string device =
+            FLAGS_device_name.substr(begin, comma - begin);
+        LOG_ASSERT(!device.empty()) << "--device_name contains an empty entry";
+        if (!devices.empty()) devices += ',';
+        devices += "\"" + device + "\"";
+        if (comma == std::string::npos) break;
+        begin = comma + 1;
+    }
+    LOG_ASSERT(!devices.empty())
+        << "--device_name is required for " << FLAGS_protocol;
+    return "{\"cpu:" + std::to_string(FLAGS_numa_node) + "\":[[" + devices +
+           "],[]]}";
+}
+
+void installSelectedTransport(mooncake::TransferEngine& engine) {
+    LOG_ASSERT(FLAGS_protocol == "ub" || FLAGS_protocol == "rdma" ||
+               FLAGS_protocol == "tcp")
+        << "--protocol must be ub, rdma, or tcp";
+    if (FLAGS_protocol == "tcp") {
+        LOG_ASSERT(engine.installTransport("tcp", nullptr) != nullptr)
+            << "TCP Transport installation failed";
+        return;
+    }
+    std::string topology = topologyJson();
+    void* args[] = {topology.data(), nullptr};
+    LOG_ASSERT(engine.installTransport(FLAGS_protocol, args) != nullptr)
+        << FLAGS_protocol << " Transport installation failed";
 }
 
 double percentile(std::vector<double> samples, double value) {
@@ -185,6 +228,7 @@ void appendRecord(const std::vector<TrafficClass>& classes,
     output << std::fixed << std::setprecision(6)
            << "{\"schema_version\":1,\"scheduling\":"
            << (FLAGS_scheduling ? "true" : "false")
+           << ",\"protocol\":\"" << FLAGS_protocol << "\""
            << ",\"repetition\":" << repetition
            << ",\"aggregate_throughput_gbps\":" << aggregate_throughput
            << ",\"classes\":[";
@@ -213,13 +257,16 @@ void appendRecord(const std::vector<TrafficClass>& classes,
 }  // namespace
 
 int main(int argc, char** argv) {
-    gflags::SetUsageMessage(
-        "Classic Transfer Engine scheduler A/B benchmark initiator");
+    gflags::SetUsageMessage("Classic Transfer Engine scheduler A/B benchmark");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     google::InitGoogleLogging(argv[0]);
 
-    LOG_ASSERT(!FLAGS_target_seg_name.empty())
-        << "--target_seg_name is required";
+    LOG_ASSERT(FLAGS_mode == "target" || FLAGS_mode == "initiator")
+        << "--mode must be target or initiator";
+    if (FLAGS_mode == "initiator")
+        LOG_ASSERT(!FLAGS_target_seg_name.empty())
+            << "--target_seg_name is required in initiator mode";
+    LOG_ASSERT(FLAGS_numa_node >= 0) << "--numa_node must be non-negative";
     LOG_ASSERT(FLAGS_foreground_threads > 0 && FLAGS_background_threads > 0);
     LOG_ASSERT(FLAGS_foreground_threads <= 128 &&
                FLAGS_background_threads <= 128)
@@ -252,16 +299,32 @@ int main(int argc, char** argv) {
     LOG_ASSERT(FLAGS_buffer_size >= required_buffer)
         << "--buffer_size must be at least " << required_buffer;
 
-    auto* local_buffer = static_cast<uint8_t*>(
-        std::aligned_alloc(4096, static_cast<size_t>(FLAGS_buffer_size)));
+    auto* local_buffer = static_cast<uint8_t*>(numa_alloc_onnode(
+        static_cast<size_t>(FLAGS_buffer_size), FLAGS_numa_node));
     LOG_ASSERT(local_buffer != nullptr) << "failed to allocate local buffer";
 
-    mooncake::TransferEngine engine(true);
+    mooncake::TransferEngine engine(false);
     LOG_ASSERT(
         engine.init(FLAGS_metadata_conn_string, FLAGS_local_server_name) == 0)
         << "TransferEngine initialization failed";
-    LOG_ASSERT(engine.registerLocalMemory(local_buffer, FLAGS_buffer_size) == 0)
+    installSelectedTransport(engine);
+    const std::string location = "cpu:" + std::to_string(FLAGS_numa_node);
+    LOG_ASSERT(engine.registerLocalMemory(local_buffer, FLAGS_buffer_size,
+                                          location) == 0)
         << "local memory registration failed";
+
+    if (FLAGS_mode == "target") {
+        std::signal(SIGINT, stopTarget);
+        std::signal(SIGTERM, stopTarget);
+        std::cout << "TARGET_SEGMENT=" << engine.getLocalIpAndPort()
+                  << " PROTOCOL=" << FLAGS_protocol << std::endl;
+        while (target_running)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        engine.unregisterLocalMemory(local_buffer);
+        engine.freeEngine();
+        numa_free(local_buffer, FLAGS_buffer_size);
+        return 0;
+    }
 
     if (FLAGS_scheduling) {
         mooncake::scheduling::SchedulerConfig config;
@@ -276,6 +339,9 @@ int main(int argc, char** argv) {
     auto segment = engine.getMetadata()->getSegmentDescByID(target);
     LOG_ASSERT(segment && !segment->buffers.empty())
         << "target segment has no registered buffers";
+    LOG_ASSERT(segment->protocol == FLAGS_protocol)
+        << "target protocol is " << segment->protocol << ", expected "
+        << FLAGS_protocol;
     const auto& remote_buffer = segment->buffers.front();
     LOG_ASSERT(remote_buffer.length >= required_buffer)
         << "target buffer must be at least " << required_buffer << " bytes";
@@ -307,6 +373,6 @@ int main(int argc, char** argv) {
     engine.closeSegment(target);
     engine.unregisterLocalMemory(local_buffer);
     engine.freeEngine();
-    std::free(local_buffer);
+    numa_free(local_buffer, FLAGS_buffer_size);
     return 0;
 }
