@@ -16,11 +16,13 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include <cstdlib>
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
+#include "master_client.h"
 #include "mooncake_logging.h"
 #include "real_client.h"
 
@@ -174,6 +176,47 @@ static std::vector<std::string> DiscoverSegmentsFromMaster(
 
     return segments;
 }
+
+static std::vector<std::string> DiscoverNoFSegmentsFromMaster(
+    const std::string& master_server, bool* success = nullptr) {
+    if (success) *success = false;
+    mooncake::MasterClient master_client(mooncake::generate_uuid());
+    auto connect_result = master_client.Connect(master_server);
+    if (connect_result != mooncake::ErrorCode::OK) {
+        LOG(ERROR) << "Failed to connect to master for NoF segment discovery: "
+                   << static_cast<int>(connect_result);
+        return {};
+    }
+
+    auto result = master_client.GetAllNoFSegments();
+    if (!result) {
+        LOG(ERROR) << "Failed to discover NoF segments: "
+                   << static_cast<int>(result.error());
+        return {};
+    }
+
+    if (success) *success = true;
+
+    std::vector<std::string> names;
+    names.reserve(result->size());
+    for (const auto& segment : *result) {
+        names.push_back(segment.name);
+    }
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return names;
+}
+
+enum class SegmentKind { MEMORY, NOF };
+
+struct BenchmarkSegment {
+    std::string name;
+    SegmentKind kind;
+};
+
+static const char* SegmentKindName(SegmentKind kind) {
+    return kind == SegmentKind::MEMORY ? "memory" : "NoF";
+}
 }  // namespace
 
 DEFINE_string(local_hostname, "localhost",
@@ -190,7 +233,8 @@ DEFINE_string(ssd_offload_path, "", "SSD offload directory path");
 
 DEFINE_string(scenario, "local_memory",
               "Benchmark scenario: local_memory, remote_memory, local_disk, "
-              "remote_disk, segment_write, segment_read, remove, batch_remove");
+              "remote_disk, segment_write, segment_read, list_segments, "
+              "remove, batch_remove");
 DEFINE_string(role, "writer",
               "Node role: writer (prefill data) or reader (benchmark reads)");
 DEFINE_uint64(value_size, 4 * MB, "Size of each value in bytes");
@@ -212,14 +256,18 @@ DEFINE_bool(hard_pin, false,
             "Pin objects to prevent eviction during benchmark");
 
 DEFINE_string(segments, "",
-              "Comma-separated segment names for segment_write/segment_read "
-              "scenarios. Use segment 'name' (typically hostname), NOT "
-              "IP:port. Leave empty to auto-discover from master.");
+              "Comma-separated memory segment names for segment scenarios. "
+              "Leave empty to auto-discover from master.");
+DEFINE_string(nof_segments, "",
+              "Comma-separated NoF segment names for segment scenarios. "
+              "Leave empty to auto-discover from master when "
+              "--nof_replica_num is nonzero.");
 DEFINE_uint64(master_admin_port, 9003,
-              "Master admin HTTP port for auto-discovering segments");
+              "Master admin HTTP port for auto-discovering memory segments; "
+              "NoF discovery uses --master_server RPC");
 DEFINE_uint64(read_segment_nums, 0,
-              "Number of segments to read from in segment_read scenario (0 = "
-              "read from all segments)");
+              "Number of memory and NoF segments to read/remove from "
+              "(0 = all, memory segments first)");
 DEFINE_uint64(duration, 0,
               "Duration in seconds for continuous reading in segment_read "
               "scenario (0 = read num_keys once)");
@@ -736,9 +784,9 @@ class StressBenchmark {
         return 0;
     }
 
-    static std::vector<std::string> ParseSegments() {
+    static std::vector<std::string> ParseSegments(const std::string& value) {
         std::vector<std::string> segments;
-        std::istringstream iss(FLAGS_segments);
+        std::istringstream iss(value);
         std::string seg;
         while (std::getline(iss, seg, ',')) {
             size_t start = seg.find_first_not_of(" \t");
@@ -750,7 +798,7 @@ class StressBenchmark {
         return segments;
     }
 
-    static std::string MakeSegmentKey(const std::string& segment, size_t idx) {
+    static std::string SanitizeSegmentName(const std::string& segment) {
         static const char* kSpecialChars = ".:-/\\[]{}()@#$%^&*+=|<>,;!?`'\"~";
         std::string sanitized = segment;
         for (char& c : sanitized) {
@@ -758,27 +806,32 @@ class StressBenchmark {
                 c = '_';
             }
         }
-        return "seg_" + sanitized + "_key_" + std::to_string(idx);
+        return sanitized;
+    }
+
+    static std::string MakeSegmentKey(const BenchmarkSegment& segment,
+                                      size_t idx) {
+        // Keep memory keys compatible with earlier benchmark runs.
+        const char* prefix = segment.kind == SegmentKind::NOF ? "nof_seg_"
+                                                              : "seg_";
+        return std::string(prefix) + SanitizeSegmentName(segment.name) +
+               "_key_" + std::to_string(idx);
     }
 
     // Key generator for remove/batch_remove scenarios. Uses a distinct
     // "rmv_" prefix so remove keys never collide with segment_write keys
     // ("seg_"). This allows remove and write benchmarks to run independently
     // without cross-contamination.
-    static std::string MakeRemoveKey(const std::string& segment, size_t idx) {
-        static const char* kSpecialChars = ".:-/\\[]{}()@#$%^&*+=|<>,;!?`'\"~";
-        std::string sanitized = segment;
-        for (char& c : sanitized) {
-            if (std::strchr(kSpecialChars, c) != nullptr || std::isspace(c)) {
-                c = '_';
-            }
-        }
-        return "rmv_" + sanitized + "_key_" + std::to_string(idx);
+    static std::string MakeRemoveKey(const BenchmarkSegment& segment,
+                                     size_t idx) {
+        const char* prefix = segment.kind == SegmentKind::NOF ? "nof_rmv_"
+                                                              : "rmv_";
+        return std::string(prefix) + SanitizeSegmentName(segment.name) +
+               "_key_" + std::to_string(idx);
     }
 
     int RunSegmentWrite() {
-        auto segments = DiscoverSegmentsIfNeeded(
-            "--segments not specified, auto-discovering");
+        auto segments = DiscoverBenchmarkSegments();
         if (segments.empty()) {
             return -1;
         }
@@ -795,7 +848,7 @@ class StressBenchmark {
         std::vector<mooncake::ReplicateConfig> configs(segments.size());
         for (size_t s = 0; s < segments.size(); ++s) {
             configs[s] = MakeReplicateConfig();
-            configs[s].preferred_segments = {segments[s]};
+            SetPreferredSegment(configs[s], segments[s]);
         }
 
         BenchmarkStats put_stats;
@@ -820,7 +873,9 @@ class StressBenchmark {
 
                 if (ret != 0) {
                     LOG(ERROR) << "put_from failed for key=" << key
-                               << " segment=" << segment << " ret=" << ret;
+                               << " segment=" << segment.name
+                               << " type=" << SegmentKindName(segment.kind)
+                               << " ret=" << ret;
                     ++seg_failed[s];
                     continue;
                 }
@@ -836,7 +891,8 @@ class StressBenchmark {
         for (size_t s = 0; s < segments.size(); ++s) {
             total_written += seg_written[s];
             total_failed += seg_failed[s];
-            LOG(INFO) << "Segment [" << s << "] " << segments[s]
+            LOG(INFO) << "Segment [" << s << "] " << segments[s].name
+                      << " type=" << SegmentKindName(segments[s].kind)
                       << " complete: " << seg_written[s] << " succeeded, "
                       << seg_failed[s] << " failed";
         }
@@ -854,8 +910,7 @@ class StressBenchmark {
     }
 
     int RunSegmentRead() {
-        auto segments = DiscoverSegmentsIfNeeded(
-            "--segments not specified, auto-discovering");
+        auto segments = DiscoverBenchmarkSegments();
         if (segments.empty()) {
             return -1;
         }
@@ -867,14 +922,15 @@ class StressBenchmark {
             read_segment_nums = segments.size();
         }
 
-        std::vector<std::string> read_segments(
+        std::vector<BenchmarkSegment> read_segments(
             segments.begin(), segments.begin() + read_segment_nums);
 
         LOG(INFO) << "=== SEGMENT READ MODE ===";
-        LOG(INFO) << "Reading from " << read_segment_nums << " segments ("
-                  << read_segment_nums << " nodes)";
+        LOG(INFO) << "Reading keys for " << read_segment_nums << " segments";
         for (size_t s = 0; s < read_segments.size(); ++s) {
-            LOG(INFO) << "  Segment [" << s << "]: " << read_segments[s];
+            LOG(INFO) << "  Segment [" << s << "]: " << read_segments[s].name
+                      << " (" << SegmentKindName(read_segments[s].kind)
+                      << ")";
         }
         LOG(INFO) << "Keys per segment: " << FLAGS_num_keys;
         LOG(INFO) << "Duration: "
@@ -921,8 +977,9 @@ class StressBenchmark {
         return RunSegmentReadDuration(read_segments, all_keys);
     }
 
-    int RunSegmentReadSinglePass(const std::vector<std::string>& read_segments,
-                                 const std::vector<std::string>& all_keys) {
+    int RunSegmentReadSinglePass(
+        const std::vector<BenchmarkSegment>& read_segments,
+        const std::vector<std::string>& all_keys) {
         LOG(INFO) << "Single-pass read with " << FLAGS_num_threads
                   << " threads";
 
@@ -1023,8 +1080,9 @@ class StressBenchmark {
         double total_latency_sum_ns = 0;
     };
 
-    int RunSegmentReadDuration(const std::vector<std::string>& read_segments,
-                               const std::vector<std::string>& all_keys) {
+    int RunSegmentReadDuration(
+        const std::vector<BenchmarkSegment>& read_segments,
+        const std::vector<std::string>& all_keys) {
         LOG(INFO) << "Duration-based continuous read with " << FLAGS_num_threads
                   << " threads for " << FLAGS_duration << "s, stats every "
                   << FLAGS_statis_interval << "s";
@@ -1318,8 +1376,7 @@ class StressBenchmark {
     }
 
     int RunSegmentRemove(bool use_batch) {
-        auto segments = DiscoverSegmentsIfNeeded(
-            "--segments not specified, auto-discovering");
+        auto segments = DiscoverBenchmarkSegments();
         if (segments.empty()) {
             return -1;
         }
@@ -1331,15 +1388,17 @@ class StressBenchmark {
             remove_segment_nums > segments.size()) {
             remove_segment_nums = segments.size();
         }
-        std::vector<std::string> remove_segments(
+        std::vector<BenchmarkSegment> remove_segments(
             segments.begin(), segments.begin() + remove_segment_nums);
 
         LOG(INFO) << "=== SEGMENT REMOVE MODE ==="
                   << (use_batch ? " (batch)" : " (single key)");
-        LOG(INFO) << "Removing from " << remove_segment_nums << " segments ("
-                  << remove_segment_nums << " nodes)";
+        LOG(INFO) << "Removing keys for " << remove_segment_nums
+                  << " segments";
         for (size_t s = 0; s < remove_segments.size(); ++s) {
-            LOG(INFO) << "  Segment [" << s << "]: " << remove_segments[s];
+            LOG(INFO) << "  Segment [" << s << "]: " << remove_segments[s].name
+                      << " (" << SegmentKindName(remove_segments[s].kind)
+                      << ")";
         }
         LOG(INFO) << "Keys per segment: " << FLAGS_num_keys;
         LOG(INFO) << "Batch size: " << FLAGS_batch_size;
@@ -1349,12 +1408,12 @@ class StressBenchmark {
                          << "removal is not idempotent, a single pass is used";
         }
 
-        // Phase 1: prefill each segment. Key layout and preferred_segments
-        // pinning mirror RunSegmentWrite exactly.
+        // Phase 1: prefill each segment with the same key layout and placement
+        // preferences as RunSegmentWrite.
         std::vector<mooncake::ReplicateConfig> configs(remove_segments.size());
         for (size_t s = 0; s < remove_segments.size(); ++s) {
             configs[s] = MakeReplicateConfig();
-            configs[s].preferred_segments = {remove_segments[s]};
+            SetPreferredSegment(configs[s], remove_segments[s]);
         }
 
         BenchmarkStats put_stats;
@@ -1379,7 +1438,9 @@ class StressBenchmark {
                 RecordPutResult(put_result, ElapsedNanos(t0, t1), ret);
                 if (ret != 0) {
                     LOG(ERROR) << "put_from failed for key=" << key
-                               << " segment=" << segment << " ret=" << ret;
+                               << " segment=" << segment.name
+                               << " type=" << SegmentKindName(segment.kind)
+                               << " ret=" << ret;
                     put_stats.FinalizeSequential();
                     put_stats.Print("REMOVE PREFILL PUT BENCHMARK");
                     return ret;
@@ -1440,32 +1501,41 @@ class StressBenchmark {
         LOG(INFO) << "Discovering segments from master at "
                   << FLAGS_master_server << ":" << FLAGS_master_admin_port;
 
-        auto segments = DiscoverSegmentsFromMaster(
+        auto memory_segments = DiscoverSegmentsFromMaster(
             FLAGS_master_server, static_cast<int>(FLAGS_master_admin_port));
+        bool nof_discovery_succeeded = false;
+        auto nof_segments = DiscoverNoFSegmentsFromMaster(
+            FLAGS_master_server, &nof_discovery_succeeded);
+        if (!nof_discovery_succeeded) return -1;
+        std::sort(memory_segments.begin(), memory_segments.end());
 
-        if (segments.empty()) {
-            LOG(ERROR) << "No segments discovered from master. "
-                       << "Check master connectivity at " << FLAGS_master_server
-                       << ":" << FLAGS_master_admin_port;
+        if (memory_segments.empty() && nof_segments.empty()) {
+            LOG(ERROR) << "No memory or NoF segments discovered from master";
             return -1;
         }
 
         std::cout << "\n";
         std::cout << "========================================"
                   << "========================================\n";
-        std::cout << "  DISCOVERED SEGMENTS [count=" << segments.size()
+        std::cout << "  DISCOVERED SEGMENTS [memory="
+                  << memory_segments.size() << ", NoF=" << nof_segments.size()
                   << "]\n";
         std::cout << "========================================"
                   << "========================================\n";
 
-        for (size_t i = 0; i < segments.size(); ++i) {
-            std::cout << "  [" << std::setw(4) << i << "] " << segments[i]
-                      << "\n";
+        for (size_t i = 0; i < memory_segments.size(); ++i) {
+            std::cout << "  [memory " << std::setw(4) << i << "] "
+                      << memory_segments[i] << "\n";
+        }
+        for (size_t i = 0; i < nof_segments.size(); ++i) {
+            std::cout << "  [NoF    " << std::setw(4) << i << "] "
+                      << nof_segments[i] << "\n";
         }
 
         std::cout << "========================================"
                   << "========================================\n";
-        std::cout << "  Total segments: " << segments.size() << "\n";
+        std::cout << "  Total segments: "
+                  << memory_segments.size() + nof_segments.size() << "\n";
         std::cout << "========================================"
                   << "========================================\n\n";
 
@@ -1507,6 +1577,15 @@ class StressBenchmark {
         config.nof_replica_num = FLAGS_nof_replica_num;
         config.with_hard_pin = FLAGS_hard_pin;
         return config;
+    }
+
+    static void SetPreferredSegment(mooncake::ReplicateConfig& config,
+                                    const BenchmarkSegment& segment) {
+        if (segment.kind == SegmentKind::NOF) {
+            config.preferred_nof_segments = {segment.name};
+        } else {
+            config.preferred_segments = {segment.name};
+        }
     }
 
     static void RecordPutResult(ThreadResult& result, int64_t latency_ns,
@@ -1782,20 +1861,43 @@ class StressBenchmark {
         return threads;
     }
 
-    std::vector<std::string> DiscoverSegmentsIfNeeded(
-        const std::string& context) {
-        auto segments = ParseSegments();
-        if (!segments.empty()) {
-            return segments;
-        }
+    std::vector<BenchmarkSegment> DiscoverBenchmarkSegments() {
+        std::vector<BenchmarkSegment> segments;
+        auto append = [&segments](std::vector<std::string> names,
+                                  SegmentKind kind) {
+            std::sort(names.begin(), names.end());
+            names.erase(std::unique(names.begin(), names.end()), names.end());
+            for (auto& name : names) {
+                segments.push_back({std::move(name), kind});
+            }
+        };
 
-        LOG(INFO) << context << ", auto-discovering from master at "
-                  << FLAGS_master_server << ":" << FLAGS_master_admin_port;
-        segments = DiscoverSegmentsFromMaster(
-            FLAGS_master_server, static_cast<int>(FLAGS_master_admin_port));
-        if (segments.empty()) {
-            LOG(ERROR) << "No segments discovered from master. "
-                       << "Check master connectivity.";
+        if (FLAGS_replica_num > 0) {
+            auto memory_segments = ParseSegments(FLAGS_segments);
+            if (memory_segments.empty()) {
+                memory_segments = DiscoverSegmentsFromMaster(
+                    FLAGS_master_server,
+                    static_cast<int>(FLAGS_master_admin_port));
+            }
+            if (memory_segments.empty()) {
+                LOG(ERROR) << "Memory replicas requested but no memory "
+                              "segments were found";
+                return {};
+            }
+            append(std::move(memory_segments), SegmentKind::MEMORY);
+        }
+        if (FLAGS_nof_replica_num > 0) {
+            auto nof_segments = ParseSegments(FLAGS_nof_segments);
+            if (nof_segments.empty()) {
+                nof_segments =
+                    DiscoverNoFSegmentsFromMaster(FLAGS_master_server);
+            }
+            if (nof_segments.empty()) {
+                LOG(ERROR) << "NoF replicas requested but no NoF segments "
+                              "were found";
+                return {};
+            }
+            append(std::move(nof_segments), SegmentKind::NOF);
         }
         return segments;
     }
@@ -1889,9 +1991,14 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  SSD offload:    "
               << (FLAGS_enable_ssd_offload ? "yes" : "no");
     if (!FLAGS_segments.empty()) {
-        LOG(INFO) << "  Segments:       " << FLAGS_segments;
+        LOG(INFO) << "  Memory segments: " << FLAGS_segments;
     } else {
-        LOG(INFO) << "  Segments:       auto-discover from master";
+        LOG(INFO) << "  Memory segments: auto-discover from master";
+    }
+    if (!FLAGS_nof_segments.empty()) {
+        LOG(INFO) << "  NoF segments:   " << FLAGS_nof_segments;
+    } else {
+        LOG(INFO) << "  NoF segments:   auto-discover from master";
     }
     LOG(INFO) << "  Master admin:   " << FLAGS_master_admin_port;
     LOG(INFO) << "  Read seg nums:  " << FLAGS_read_segment_nums;
@@ -1899,6 +2006,13 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  Stats interval: " << FLAGS_statis_interval << "s";
     LOG(INFO) << "  Client init wait: " << FLAGS_client_init_wait_seconds
               << "s";
+
+    // Listing is read-only. Do not mount the benchmark's own memory segment
+    // before taking a snapshot of the segments already registered with Master.
+    if (FLAGS_scenario == "list_segments") {
+        StressBenchmark bench;
+        return bench.Run();
+    }
 
     if (FLAGS_replica_num == 0 && FLAGS_nof_replica_num == 0) {
         LOG(ERROR) << "--replica_num and --nof_replica_num cannot both be 0";
