@@ -32,12 +32,12 @@ else()
 endif()
 target_include_directories(ub_transport
         PUBLIC
-        ${URMA_INCLUDE_DIR}
+        ${urma_INCLUDE_DIR}
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../mooncake-integration/store
 )
 set(_UB_SAVED_CMAKE_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES})
-set(CMAKE_REQUIRED_INCLUDES ${URMA_INCLUDE_DIR})
+set(CMAKE_REQUIRED_INCLUDES ${urma_INCLUDE_DIR})
 check_cxx_source_compiles("
 #include <urma_api.h>
 int main() {
@@ -51,9 +51,11 @@ unset(_UB_SAVED_CMAKE_REQUIRED_INCLUDES)
 if(NOT HAVE_URMA_SEG_CFG_IS_GPU_SEG)
     message(FATAL_ERROR
             "URMA headers lack urma_seg_cfg_t::is_gpu_seg, which is required for "
-            "GDR support. Please use a newer UMDK via -DURMA_ROOT pointing to "
-            "a source tree whose urma_api.h/urma_types.h include the is_gpu_seg "
-            "field.")
+            "GDR support. Point -DURMA_ROOT at the directory containing urma_api.h "
+            "(e.g. <umdk>/src/urma/lib/urma/core/include) and -DUMDK_ROOT at the "
+            "directory containing urma_ubagg.h (e.g. "
+            "<umdk>/src/urma/lib/urma/bond/include), or install the UMDK SDK "
+            "headers to /usr/include/ub.")
 endif()
 target_compile_definitions(ub_transport
         PRIVATE HAVE_URMA_SEG_CFG_IS_GPU_SEG=1)
