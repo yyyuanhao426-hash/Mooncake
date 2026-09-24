@@ -39,7 +39,6 @@ cd Mooncake
 # 启用 UB 传输层进行配置
 mkdir build && cd build
 cmake .. -DUSE_UB=ON \
-         -DURMA_INCLUDE_DIR=/usr/include \
          -DURMA_LIBRARY=/usr/lib64/liburma.so
 
 # 编译

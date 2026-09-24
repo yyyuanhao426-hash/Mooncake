@@ -86,9 +86,12 @@ mkdir build && cd build
 
 cmake .. \
     -DUSE_UB=ON \
-    -DURMA_INCLUDE_DIR=/usr/include \
     -DURMA_LIBRARY=/usr/lib64/liburma.so \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+# URMA headers are discovered by FindUrma.cmake (URMA_ROOT / UMDK_ROOT /
+# /usr/include/ub / /usr/include, then FetchContent); no include-dir flag is
+# needed when the SDK is installed.
 
 make -j$(nproc)
 ```

@@ -43,7 +43,11 @@ Measure cross-node GDR transfer from a remote SSD to GPU HBM:
 
 - **UMDK user-mode lib** with `urma_seg_cfg_t::is_gpu_seg` field (e.g. the
   `UMDK_tool_netlab` source tree). The build probes this field and aborts
-  (FATAL_ERROR) if missing.
+  (FATAL_ERROR) if missing. Headers are discovered by `FindUrma.cmake` in
+  this order: `-DURMA_ROOT` → `$URMA_ROOT` (env) → `-DUMDK_ROOT` →
+  `$UMDK_ROOT` (env) → `/usr/include/ub` → `/usr/include`; if none has the
+  headers, UMDK `v25.12.0.B081` is fetched via FetchContent (that tag may
+  lack `is_gpu_seg`, so prefer an explicit UMDK tree or an installed SDK).
 - **UMDK kernel-mode libs** (ubcore / udma driver modules matching the UMDK
   version).
 - **oe-kernel-6.6.0** with user-defined IOMMU / UMMU to adapt GPU direct access.
@@ -76,7 +80,8 @@ cmake .. \
   -DCMAKE_SKIP_RPATH=ON \
   -DCMAKE_BUILD_RPATH="" \
   -DCMAKE_INSTALL_RPATH="" \
-  -DURMA_ROOT=/path/to/umdk/src/urma/lib/urma \
+  -DURMA_ROOT=<umdk>/src/urma/lib/urma/core/include \
+  -DUMDK_ROOT=<umdk>/src/urma/lib/urma/bond/include \
   -DURMA_LIBRARY=/path/to/liburma.so
 
 # USE_UB: enable UB protocol transport (required for GDR)
@@ -85,8 +90,15 @@ cmake .. \
 #            page cache); strongly recommended when the SSD offload path is
 #            backed by NVMe (Gen4/Gen5). Without this flag the writer falls
 #            back to synchronous preadv, which limits SSD read throughput.
-# URMA_ROOT: UMDK URMA lib dir (core/include + bond/include) for is_gpu_seg probe;
-#            empty falls back to FetchContent
+# URMA_ROOT: directory that directly contains urma_api.h
+#            (e.g. <umdk>/src/urma/lib/urma/core/include)
+# UMDK_ROOT: directory that directly contains urma_ubagg.h
+#            (e.g. <umdk>/src/urma/lib/urma/bond/include)
+#            FindUrma.cmake searches URMA_ROOT -> $URMA_ROOT -> UMDK_ROOT ->
+#            $UMDK_ROOT -> /usr/include/ub -> /usr/include, then falls back to
+#            FetchContent (UMDK v25.12.0.B081; may lack is_gpu_seg). With an
+#            SDK installed under /usr/include/ub both flags can be omitted.
+#            The discovered dirs are exported as urma_INCLUDE_DIR.
 # URMA_LIBRARY: path to liburma.so file; empty falls back to find_library, then mock
 # CMAKE_SKIP_RPATH=ON: disable RPATH so the binary relies on LD_LIBRARY_PATH for
 #                      shared library resolution (prevents stale build-machine paths)
@@ -101,7 +113,11 @@ make -j$(nproc) stress_cluster_bench mooncake_master mooncake_client
 
 - The configure step probes `urma_seg_cfg_t::is_gpu_seg` via
   `check_cxx_source_compiles` and aborts (FATAL_ERROR) if the UMDK headers
-  lack the field. Point `URMA_ROOT` at a tree that has it (e.g. `UMDK_tool_netlab`).
+  lack the field. Point `URMA_ROOT` at the directory containing `urma_api.h`
+  and `UMDK_ROOT` at the directory containing `urma_ubagg.h` from a tree that
+  has the field (e.g. `UMDK_tool_netlab`: `.../lib/urma/core/include` and
+  `.../lib/urma/bond/include`), or install the SDK headers to
+  `/usr/include/ub` and omit both flags.
 
 ## 4. Deployment
 
