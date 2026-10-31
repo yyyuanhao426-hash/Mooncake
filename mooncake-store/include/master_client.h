@@ -1014,7 +1014,7 @@ class MasterClient {
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> InvokeRoutedWithSlotRetry(
         RoutedCallTiming* timing, const std::string& tenant_id,
-        const std::string& key, Args... args);
+        const std::string& key, uint32_t rpc_stat_key, Args... args);
 
     /**
      * @brief Batch 路由自愈（与 InvokeRoutedWithSlotRetry 的单 key 版互补）。

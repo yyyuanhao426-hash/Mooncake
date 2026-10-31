@@ -253,9 +253,14 @@ tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
 }  // namespace
 
 MasterAdminServer::MasterAdminServer(uint16_t http_port,
-                                     bool enable_metric_reporting)
+                                     bool enable_metric_reporting,
+                                     uint32_t metrics_log_interval_sec)
     : http_port_(http_port),
       enable_metric_reporting_(enable_metric_reporting),
+      metrics_log_interval_sec_(
+          metrics_log_interval_sec == 0
+              ? kMetricReportIntervalSeconds
+              : std::max<uint64_t>(1, metrics_log_interval_sec)),
       http_server_(4, http_port) {}
 
 MasterAdminServer::~MasterAdminServer() { Stop(); }
@@ -313,8 +318,13 @@ bool MasterAdminServer::Start() {
                                    ? snapshot.service->GetOwnedSlotCount()
                                    : 0u);
                 LOG(INFO) << log_stream.str();
+                // vsegment/psegment 术语的周期状态行（独立于 Master Admin
+                // Metrics 巨行；enabled=0 时同样输出以显式表达"未启用"）。
+                if (snapshot.service) {
+                    LOG(INFO) << snapshot.service->GetVSegmentStatusLogLine();
+                }
                 if (metric_report_stop_sem_.try_acquire_for(
-                        std::chrono::seconds(kMetricReportIntervalSeconds))) {
+                        std::chrono::seconds(metrics_log_interval_sec_))) {
                     break;
                 }
             }

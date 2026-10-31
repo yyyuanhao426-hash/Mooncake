@@ -323,9 +323,37 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
+Status MultiTransport::getSliceTimings(
+    BatchID batch_id, size_t task_id,
+    std::vector<Transport::SliceTiming>& timings) {
+    timings.clear();
+    if (scheduler_ && scheduler_->owns(batch_id)) {
+        return Status::InvalidArgument(
+            "getSliceTimings is not supported for scheduler-owned batches");
+    }
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    const size_t task_count = batch_desc.task_list.size();
+    if (task_id >= task_count) {
+        return Status::InvalidArgument("Task ID out of range");
+    }
+    // Read-only snapshot of the slice list. The caller must only invoke this
+    // after the task reached a terminal state (all slices terminal), so no
+    // concurrent mutation of slice_list can occur.
+    auto& task = batch_desc.task_list[task_id];
+    timings.reserve(task.slice_list.size());
+    for (const auto* slice : task.slice_list) {
+        Transport::SliceTiming timing;
+        timing.peer_nic_path = slice->peer_nic_path;
+        timing.length = slice->length;
+        timing.post_ts = slice->ts;
+        timing.done_ts = slice->done_ts;
+        timings.push_back(std::move(timing));
+    }
+    return Status::OK();
+}
+
 Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
-                                              TransferStatus& status) {
-    if (scheduler_ && scheduler_->owns(batch_id))
+                                              TransferStatus& status) {    if (scheduler_ && scheduler_->owns(batch_id))
         return scheduler_->batchStatus(batch_id, status);
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();

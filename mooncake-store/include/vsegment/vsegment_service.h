@@ -57,6 +57,11 @@ class VSegmentService final {
         return partition_configs_.count(partition_id) != 0;
     }
     const std::vector<std::string>& PartitionIds() const { return partition_ids_; }
+    // Observability getters for the periodic VSegment Status log line:
+    // number of installed partition managers, and the number of vsegments
+    // (active + preparing) across them.
+    size_t PartitionCount();
+    size_t VSegmentCount();
     // 注入运行时坏端点排除集提供者，并向所有已存在的 partition manager
     // 透传；后续新增的 manager 在 AddPartition 时同样透传。物理分配时用
     // 于把新 vsegment 的条带成员避开已判死的物理段。

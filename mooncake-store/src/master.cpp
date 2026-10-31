@@ -6,6 +6,7 @@
 
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
+#include <algorithm>  // For std::max
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
@@ -127,6 +128,9 @@ DEFINE_int32(
     max_threads, 16,
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
+DEFINE_int32(admin_metrics_log_interval_sec, 10,
+             "Interval in seconds for the admin metrics log and the periodic "
+             "VSegment status log (clamped to >= 1)");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
               "Default lease time for kv objects. Supports raw milliseconds "
@@ -1196,6 +1200,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.cvm_http_port = static_cast<uint16_t>(FLAGS_cvm_http_port);
     }
+    if ((google::GetCommandLineFlagInfo("admin_metrics_log_interval_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.admin_metrics_log_interval_sec =
+            std::max(1, FLAGS_admin_metrics_log_interval_sec);
+    }
     if ((google::GetCommandLineFlagInfo("cvm_http_host", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1547,6 +1558,14 @@ BuildVSegmentAutoPlanPolicy(const mooncake::MasterConfig& config) {
     policy.stripe_size = FLAGS_vsegment_stripe_size;
     policy.member_extent_size = FLAGS_vsegment_member_extent_size;
     policy.reserved_ratio = FLAGS_vsegment_reserved_ratio;
+    LOG(INFO) << "VSegment auto-plan policy: member_count="
+              << policy.member_count << ", stripe_size="
+              << policy.stripe_size << ", member_extent_size="
+              << policy.member_extent_size << ", reserved_ratio="
+              << policy.reserved_ratio << ", required_medium="
+              << (policy.required_medium.empty() ? "auto"
+                                                 : policy.required_medium)
+              << ", io_alignment=" << policy.io_alignment;
     return policy;
 }
 
@@ -1588,12 +1607,15 @@ void TryAutoPlanVSegmentQuota(
         /*detail=*/nullptr, &summary);
     if (err == mooncake::ErrorCode::OK) {
         LOG(INFO) << "vsegment auto-plan published: " << summary;
+        mooncake::vsegment::LogVSegmentPoolFormed(config.cluster_id);
     } else if (err == mooncake::ErrorCode::ETCD_TRANSACTION_FAIL) {
         LOG(INFO) << "vsegment auto-plan: another instance published "
                      "concurrently; skipping";
     } else {
-        LOG(ERROR) << "vsegment auto-plan failed: "
-                   << mooncake::toString(err);
+        LOG(WARNING) << "VSegment auto-plan deferred: no eligible psegment "
+                        "pool yet ("
+                     << mooncake::toString(err)
+                     << "), will retry on psegment mount / heartbeat";
     }
 }
 #endif  // STORE_USE_ETCD
@@ -1913,7 +1935,8 @@ int main(int argc, char* argv[]) {
                 metadata_server_ptr, http_metadata_remote_url);
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
-            master_config.enable_metric_reporting);
+            master_config.enable_metric_reporting,
+            master_config.admin_metrics_log_interval_sec);
         if (!admin_server.Start()) {
             LOG(ERROR) << "Failed to start master admin server";
             return 1;

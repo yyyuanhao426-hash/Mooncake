@@ -23,6 +23,10 @@ class VSegmentMetrics {
     void IncRecoveryFailure() { recovery_failure_.fetch_add(1); }
     void IncStaleRoute() { stale_route_.fetch_add(1); }
 
+    // Read-side getters for the periodic VSegment Status log line.
+    uint64_t logical_capacity_bytes() const { return total_bytes_.load(); }
+    uint64_t logical_free_bytes() const { return free_bytes_.load(); }
+
     std::string Serialize() const;
 
    private:

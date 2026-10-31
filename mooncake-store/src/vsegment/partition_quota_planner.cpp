@@ -502,4 +502,71 @@ ErrorCode PlanAndPublishDiscoveredQuota(
     return ErrorCode::OK;
 }
 
+void LogVSegmentPoolFormed(const std::string& cluster_namespace) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    std::string detail;
+    EtcdPartitionQuotaSnapshotStore store(cluster_namespace);
+    if (store.Load(&snapshot, &detail) != ErrorCode::OK) return;
+
+    // psegment id -> descriptor（endpoint/medium），用于成员清单的
+    // id@store(numaN) 呈现；加载失败时退化为仅打印 id。
+    std::map<std::string, cvm::SegmentDescriptor> descriptors;
+    {
+        std::vector<cvm::SegmentDescriptor> loaded;
+        ViewVersionId revision = 0;
+        if (cvm::EtcdViewStore::LoadAllSegmentDescriptors(cluster_namespace,
+                                                          loaded, revision) ==
+            ErrorCode::OK) {
+            for (const auto& d : loaded) descriptors[d.segment_id] = d;
+        }
+    }
+    auto numa_of = [](const std::string& medium) -> std::string {
+        const std::string kPrefix = "cpu:";
+        if (medium.rfind(kPrefix, 0) == 0 &&
+            medium.size() > kPrefix.size()) {
+            try {
+                return "numa" + std::to_string(
+                                    std::stoi(medium.substr(kPrefix.size())));
+            } catch (const std::exception&) {
+            }
+        }
+        return "n/a";
+    };
+
+    std::ostringstream os;
+    os << "VSegment pool formed: generation=" << snapshot.config_generation
+       << ", profiles=" << snapshot.profile_specs.size();
+    for (size_t i = 0; i < snapshot.profile_specs.size(); ++i) {
+        const auto& profile = snapshot.profile_specs[i];
+        os << (i == 0 ? " | " : "; ") << "profile[" << i << "]: name="
+           << profile.name << ", medium=" << profile.required_medium
+           << ", member_count=" << profile.member_count
+           << ", stripe_size=" << profile.stripe_size
+           << ", member_extent_size=" << profile.member_extent_size
+           << ", members=[";
+        // 取 partition "0" 在该 profile 下的配额 extents 作为成员池清单
+        // （所有 partition 的成员集合相同：候选 = 池内全部 psegment）。
+        bool first_member = true;
+        for (const auto& quota : snapshot.quotas) {
+            if (quota.partition_id != "0" || quota.profile_name != profile.name)
+                continue;
+            for (const auto& extent : quota.extents) {
+                if (!first_member) os << ", ";
+                first_member = false;
+                auto found = descriptors.find(extent.segment_id);
+                if (found != descriptors.end()) {
+                    os << extent.segment_id << "@"
+                       << found->second.te_endpoint << "("
+                       << numa_of(found->second.medium) << ")";
+                } else {
+                    os << extent.segment_id;
+                }
+            }
+            break;
+        }
+        os << "]";
+    }
+    LOG(INFO) << os.str();
+}
+
 }  // namespace mooncake::vsegment

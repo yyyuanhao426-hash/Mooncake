@@ -31,6 +31,10 @@ inline std::string ResolveConfiguredHABackendConnstring(
 // The configuration for the master server
 struct MasterConfig {
     bool enable_metric_reporting;
+    // Interval (seconds, clamped to >=1) of the admin metrics log thread,
+    // which emits both the "Master Admin Metrics" line and the periodic
+    // "VSegment Status" line. --admin_metrics_log_interval_sec overrides.
+    uint32_t admin_metrics_log_interval_sec = 10;
     uint32_t metrics_port;
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
@@ -233,6 +237,10 @@ class MasterServiceSupervisorConfig {
 
     // Parameters with default values (optional parameters)
     std::string rpc_address = "0.0.0.0";
+    // Interval (seconds, clamped to >=1) of the admin metrics log thread,
+    // which emits both the "Master Admin Metrics" line and the periodic
+    // "VSegment Status" line. --admin_metrics_log_interval_sec overrides.
+    uint32_t admin_metrics_log_interval_sec = 10;
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
@@ -368,6 +376,8 @@ class MasterServiceSupervisorConfig {
     MasterServiceSupervisorConfig(const MasterConfig& config) {
         // Set required parameters using RequiredParam
         enable_metric_reporting = config.enable_metric_reporting;
+        admin_metrics_log_interval_sec =
+            config.admin_metrics_log_interval_sec;
         metrics_port = static_cast<int>(config.metrics_port);
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;

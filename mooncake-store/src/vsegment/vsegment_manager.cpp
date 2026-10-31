@@ -1,9 +1,11 @@
 #include "vsegment/vsegment_manager.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <set>
+#include <sstream>
 
 #include "vsegment/vsegment_metrics.h"
 
@@ -266,6 +268,8 @@ VSegmentAllocationResult VSegmentManager::CreateSingleFlight(
     // Preserve submission order under mutex_; wait outside the critical section.
     std::shared_ptr<VSegmentDeferredCommitHandle> fence;
     VSegmentAllocationResult result;
+    bool fresh_created = false;
+    std::string fresh_vsegment_id;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!owned_ ||
@@ -335,6 +339,8 @@ VSegmentAllocationResult VSegmentManager::CreateSingleFlight(
                 }
             }
             result = allocation;
+            fresh_created = true;
+            fresh_vsegment_id = vsegment_id;
         }
     }
     if (batch) {
@@ -342,6 +348,36 @@ VSegmentAllocationResult VSegmentManager::CreateSingleFlight(
     } else {
         const auto error = WaitForDurable(fence, &result.detail);
         if (error != ErrorCode::OK) result.error = error;
+    }
+    // vsegment/psegment 术语的创建可见性日志（锁外打印，避免拖慢提交序）：
+    // 进程内首卷 INFO 全量（成员 extent 清单），此后 VLOG(1) 防刷屏
+    //（16384 partition 首建期每 partition 一卷）；聚合计数见周期
+    // "VSegment Status" 行与 VSegmentMetrics。adopted（PREPARING→ACTIVE
+    // 续提交流程）不算新创建，不打。
+    if (fresh_created && result.error == ErrorCode::OK) {
+        static std::atomic<bool> s_first_vsegment_logged{false};
+        const bool first = !s_first_vsegment_logged.exchange(true);
+        if (first || VLOG_IS_ON(1)) {
+            std::ostringstream os;
+            os << "VSegment created" << (first ? " (first)" : "")
+               << ": partition=" << partition_id_
+               << ", id=" << fresh_vsegment_id
+               << ", capacity=" << result.view.logical_capacity
+               << ", members=[";
+            for (size_t m = 0; m < result.view.members.size(); ++m) {
+                if (m) os << ", ";
+                const auto& member = result.view.members[m];
+                os << "{" << member.segment_id
+                   << ",offset=" << member.base_offset
+                   << ",len=" << member.length << "}";
+            }
+            os << "]";
+            if (first) {
+                LOG(INFO) << os.str();
+            } else {
+                VLOG(1) << os.str();
+            }
+        }
     }
     return result;
 }

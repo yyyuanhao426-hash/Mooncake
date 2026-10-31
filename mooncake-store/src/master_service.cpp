@@ -67,6 +67,7 @@
 #include "io_pattern/cfm_service.h"
 #include "vsegment/partition_quota_planner.h"
 #include "vsegment/vsegment_ha.h"
+#include "vsegment/vsegment_metrics.h"
 
 namespace mooncake {
 
@@ -1228,6 +1229,16 @@ ErrorCode MasterService::StartSlotOwnerHeartbeat() {
             LOG(ERROR) << "Failed to refresh vsegment ownership: "
                        << toString(error);
         }
+        // kNoQuota 稳态的低频重探：resolver 每心跳恰执行一次（心跳线程），
+        // 绝不在 slot 认领热路径上 spawn。重探线程不触碰 state（见
+        // MaybeSpawnVSegmentInit），放行率不受影响；运行期发布 quota 后由
+        // 它推进 kInProgress → kReady。
+        if (vsegment_runtime_gate_active_.load(std::memory_order_acquire) &&
+            vsegment_init_state_.load(std::memory_order_acquire) ==
+                VSegmentInitState::kNoQuota &&
+            !vsegment_service_) {
+            MaybeSpawnVSegmentInit();
+        }
         return slots;
     };
     hb_config.lease_id = cvm_lease_id_;
@@ -1375,6 +1386,7 @@ bool MasterService::MaybeRetryVSegmentAutoPlan(const char* trigger) {
                               : std::string(
                                     ": another instance published "
                                     "concurrently"));
+            vsegment::LogVSegmentPoolFormed(cluster_id_);
             break;
         case ErrorCode::INVALID_PARAMS: {
             // 策略非法（非资源不足），重试无意义：终态锁存 + 单次 WARNING。
@@ -1425,10 +1437,18 @@ bool MasterService::MaybeRetryVSegmentAutoPlan(const char* trigger) {
 ErrorCode MasterService::RefreshVSegmentOwnership(
     const std::string& acquiring, vsegment::VSegmentCommitBatch* batch) {
     if (!ordered_oplog_writer_) return ErrorCode::OK;
-    if (vsegment_runtime_gate_active_.load(std::memory_order_acquire) &&
-        vsegment_init_state_.load(std::memory_order_acquire) != VSegmentInitState::kReady) {
-        MaybeSpawnVSegmentInit();
-        return ErrorCode::VSEGMENT_SERVICE_NOT_READY;
+    if (vsegment_runtime_gate_active_.load(std::memory_order_acquire)) {
+        const auto gate_state =
+            vsegment_init_state_.load(std::memory_order_acquire);
+        if (gate_state == VSegmentInitState::kIdle ||
+            gate_state == VSegmentInitState::kInProgress) {
+            MaybeSpawnVSegmentInit();
+            return ErrorCode::VSEGMENT_SERVICE_NOT_READY;
+        }
+        // kNoQuota：quota 快照不存在（vsegment 关闭或尚未发布）。slot 就绪
+        // 不依赖 vsegment——放行到 null-service 分支按冷启动同款语义处理，
+        // 绝不能被永不完成的初始化门控阻塞（否则 vsegment-off 部署下所有
+        // slot 永久 NOT_READY → put 永久 SLOT_MIGRATING）。
     }
     if (!vsegment_service_) {
         if (!vsegment_runtime_gate_active_.load(std::memory_order_acquire)) {
@@ -1449,7 +1469,14 @@ ErrorCode MasterService::RefreshVSegmentOwnership(
                     // 发布侧自愈成功：立即重读快照并继续本周期拉起。
                     error = store.Load(&quota, &detail);
                 }
-                if (error == ErrorCode::ETCD_KEY_NOT_EXIST) return ErrorCode::OK;
+                if (error == ErrorCode::ETCD_KEY_NOT_EXIST) {
+                    // quota 缺席（vsegment off / 未发布）：slot 就绪不依赖
+                    // vsegment。置 kNoQuota 稳态（运行期门控放行），消除第
+                    // 一轮心跳遗留 kIdle 的慢热前段。
+                    vsegment_init_state_.store(VSegmentInitState::kNoQuota,
+                                               std::memory_order_release);
+                    return ErrorCode::OK;
+                }
                 if (error != ErrorCode::OK) {
                     LOG(ERROR) << "Failed to load vsegment quota: " << detail;
                     return error;
@@ -1464,10 +1491,21 @@ ErrorCode MasterService::RefreshVSegmentOwnership(
             }
         } else {
             // 运行期异步门控：心跳线程绝不内联执行分钟级的「首建 + 首次全
-            // 量 reconcile sweep」。kIdle 则拉起后台首建线程；kInProgress 表
-            // 示已在进行。NOT_READY 对全部运行期调用方均为可重试语义：
-            // slot_migrator 的 on_acquire pending 路径、P4 reshard 下一轮
-            // 重拉、心跳周期 reconcile 跳过本周期。
+            // 量 reconcile sweep」。kIdle/kInProgress 表示首建进行中——
+            // NOT_READY 对全部运行期调用方均为可重试语义。
+            //
+            // kNoQuota（quota 缺席/读取失败的稳态）：与冷启动
+            // KEY_NOT_EXIST 路径语义对齐——slot 就绪不依赖 vsegment，直接
+            // 放行。★此路径绝不调用 MaybeSpawnVSegmentInit：重探由心跳
+            // resolver 每周期低频驱动（见 dynamic_slot_resolver）；在 slot
+            // 认领热路径上 spawn 会把 state 打回 kInProgress，使每轮心跳只
+            // 放行 ~1 个 slot（16384 slot 需 22 小时）。绝不 fallthrough
+            // 到 reconcile：service 为空。
+            const auto gate_state =
+                vsegment_init_state_.load(std::memory_order_acquire);
+            if (gate_state == VSegmentInitState::kNoQuota) {
+                return ErrorCode::OK;
+            }
             MaybeSpawnVSegmentInit();
             return ErrorCode::VSEGMENT_SERVICE_NOT_READY;
         }
@@ -1735,8 +1773,22 @@ ErrorCode MasterService::RunVSegmentOwnershipReconcile(
 // 部收 NOT_READY，本线程独占 reconcile（recovered_vsegment_snapshots_
 // 等无并发访问面）。
 void MasterService::VSegmentInitThreadFunc() {
+    // 探测/首建全程持有独立 in-flight 标志（出口自动清除）。探测阶段绝不
+    // 置 kInProgress：quota 缺席的重探对 slot 就绪无影响，gate 保持 kNoQuota
+    // 放行。仅当 Load 成功（quota 确认存在）才进入 kInProgress——首建
+    // （Construct + 首扫）期间阻塞 slot 是设计原意。
+    struct ProbeGuard {
+        std::atomic<bool>& flag;
+        ~ProbeGuard() { flag.store(false, std::memory_order_release); }
+    } probe_guard{vsegment_init_probe_in_flight_};
     try {
         std::lock_guard<std::mutex> init_lock(vsegment_service_init_mutex_);
+        if (vsegment_service_) {
+            // 双检：冷启动路径已构造（探测竞态输家），直接收敛 kReady。
+            vsegment_init_state_.store(VSegmentInitState::kReady,
+                                       std::memory_order_release);
+            return;
+        }
         vsegment::PartitionPhysicalQuotaSnapshot quota;
         std::string detail;
         vsegment::EtcdPartitionQuotaSnapshotStore store(cluster_id_);
@@ -1747,20 +1799,27 @@ void MasterService::VSegmentInitThreadFunc() {
             error = store.Load(&quota, &detail);
         }
         if (error == ErrorCode::ETCD_KEY_NOT_EXIST) {
-            // 快照仍未发布（重试受节流/静默期门控属正常稳态）：复位 kIdle，
-            // 后续心跳周期重触发（每周期一次线程拉起 + 一次 etcd Get，开销
-            // 可忽略）。
-            vsegment_init_state_.store(VSegmentInitState::kIdle,
+            // 快照仍未发布（重试受节流/静默期门控属正常稳态）：置 kNoQuota
+            // 终态语义——quota 缺席不阻塞 slot 就绪（门控放行），但仍允许
+            // 每心跳一次的重探（本函数经 MaybeSpawnVSegmentInit 的
+            // kNoQuota 分支重拉），使运行期发布后自动转换到 kReady。
+            vsegment_init_state_.store(VSegmentInitState::kNoQuota,
                                        std::memory_order_release);
             return;
         }
         if (error != ErrorCode::OK) {
             LOG(WARNING) << "vsegment background init load failed: " << detail
                          << " (will retry on next heartbeat)";
-            vsegment_init_state_.store(VSegmentInitState::kIdle,
+            // etcd 读取失败同样不阻塞 slot（slot 就绪不依赖 vsegment）：
+            // 置 kNoQuota 放行 + 每心跳重探，绝不置 kIdle 挂起 slot。
+            vsegment_init_state_.store(VSegmentInitState::kNoQuota,
                                        std::memory_order_release);
             return;
         }
+        // quota 确认存在：进入首建阶段——此刻起阻塞 slot（kInProgress），
+        // 直至 Construct + 首扫完成（kReady）。
+        vsegment_init_state_.store(VSegmentInitState::kInProgress,
+                                   std::memory_order_release);
         ConstructVSegmentService(std::move(quota));
         LOG(INFO) << "vsegment service published via background init; "
                      "running first full reconcile sweep";
@@ -1781,33 +1840,42 @@ void MasterService::VSegmentInitThreadFunc() {
         }
     } catch (const std::exception& e) {
         LOG(ERROR) << "vsegment background init crashed: " << e.what()
-                   << " (state reset to idle, will retry)";
-        vsegment_init_state_.store(VSegmentInitState::kIdle,
+                   << " (state set to kNoQuota, slots keep proceeding; "
+                      "will retry on next heartbeat)";
+        // 崩溃同样不永久挂起 slot：kNoQuota 放行 + 重探。
+        vsegment_init_state_.store(VSegmentInitState::kNoQuota,
                                    std::memory_order_release);
     }
 }
 
-// kIdle → 拉起后台首建线程（幂等，任一调用线程触发均安全；CAS 抢拉起
-// 权 + spawn 锁串行化线程生命周期）。
+// 拉起后台 init/重探线程（幂等）。防重入使用独立的
+// vsegment_init_probe_in_flight_ 原子标志——★绝不 CAS 修改
+// vsegment_init_state_★：把防重入编码进 state（kIdle/kNoQuota →
+// kInProgress 的 CAS）曾使 slot 认领热路径上的每次放行都制造一个
+// kInProgress 窗口（init 线程的 etcd Get），把 slot 就绪压到 ~1 个/心跳。
+// 现在 spawn 对 gate 完全不可见：kNoQuota 探测期间 state 保持 kNoQuota，
+// slot 持续放行；仅 VSegmentInitThreadFunc 在 Load 确认 quota 存在后
+// 才置 kInProgress（首建阶段阻塞 slot 属设计原意）。
 void MasterService::MaybeSpawnVSegmentInit() {
     auto state = vsegment_init_state_.load(std::memory_order_acquire);
     if (state == VSegmentInitState::kReady) {
         // kReady 蕴含 vsegment_service_ 已发布；若此时仍为空（不变式被破
         // 坏），自愈回 kIdle 重新拉起，绝不 fallthrough 空指针解引用。
         if (vsegment_service_ != nullptr) return;
-        vsegment_init_state_.compare_exchange_strong(
-            state, VSegmentInitState::kIdle);
+        vsegment_init_state_.store(VSegmentInitState::kIdle,
+                                   std::memory_order_release);
         state = VSegmentInitState::kIdle;
     }
-    if (state != VSegmentInitState::kIdle) return;  // kInProgress：已在跑
-    if (!vsegment_init_state_.compare_exchange_strong(
-            state, VSegmentInitState::kInProgress)) {
-        return;  // 另一线程刚赢得拉起权
+    if (state == VSegmentInitState::kInProgress) {
+        return;  // 首建进行中：init 线程自身管理状态，无需重探
+    }
+    if (vsegment_init_probe_in_flight_.exchange(true,
+                                                 std::memory_order_acq_rel)) {
+        return;  // 探测线程已在跑
     }
     std::lock_guard<std::mutex> spawn_lock(vsegment_init_spawn_mutex_);
     if (vsegment_init_thread_.joinable()) {
-        // 回收上一轮已结束（kIdle 复位后退出）未 join 的线程——其退出仅
-        // 早于本次 store(kInProgress) 数微秒，join 立即返回。
+        // 回收上一轮已结束未 join 的线程（in-flight 标志保证其已退出）。
         vsegment_init_thread_.join();
     }
     try {
@@ -1817,11 +1885,11 @@ void MasterService::MaybeSpawnVSegmentInit() {
         // 等关键节点已有 INFO（见 VSegmentInitThreadFunc）。
         VLOG(1) << "vsegment background init thread spawned";
     } catch (const std::system_error& e) {
-        // 线程创建失败（资源耗尽等）：复位 kIdle，下一心跳重试。
+        // 线程创建失败（资源耗尽等）：清除 in-flight，下一心跳重试。
         LOG(ERROR) << "vsegment background init thread spawn failed: "
                    << e.what() << " (will retry next heartbeat)";
-        vsegment_init_state_.store(VSegmentInitState::kIdle,
-                                   std::memory_order_release);
+        vsegment_init_probe_in_flight_.store(false,
+                                             std::memory_order_release);
     }
 }
 
@@ -3359,6 +3427,38 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
         segment.host_id.empty() ? desc.segment_id : segment.host_id;
     desc.used_bytes = used_bytes;
     desc.vsegment_exclusive = cvm_segments_vsegment_exclusive_;
+    // vsegment/psegment 术语的注册可见性日志（存量日志不动，仅此新增行）。
+    // numa_node 从 medium "cpu:N" 解析（N 为 NUMA 节点号，非核号）；
+    // 非 cpu: 前缀（cuda:/ssd:/集群默认值）打印 n/a。
+    {
+        const std::string kNumaPrefix = "cpu:";
+        std::string numa_node = "n/a";
+        if (desc.medium.rfind(kNumaPrefix, 0) == 0 &&
+            desc.medium.size() > kNumaPrefix.size()) {
+            try {
+                numa_node =
+                    "numa" + std::to_string(std::stoi(
+                                 desc.medium.substr(kNumaPrefix.size())));
+            } catch (const std::exception&) {
+            }
+        }
+        LOG(INFO) << "PSegment registered: id=" << desc.segment_id
+                  << ", store=" << desc.te_endpoint
+                  << ", host=" << desc.host_id
+                  << ", numa_node=" << numa_node
+                  << ", medium=" << desc.medium
+                  << ", capacity=" << desc.capacity
+                  << ", used=" << desc.used_bytes << ", available="
+                  << (desc.capacity > desc.used_bytes
+                          ? desc.capacity - desc.used_bytes
+                          : 0)
+                  << ", protocol=" << desc.protocol
+                  << ", io_alignment=" << desc.io_alignment
+                  << ", unaligned_io="
+                  << (desc.supports_unaligned_io ? "supported" : "unsupported")
+                  << ", failure_domain=" << desc.failure_domain
+                  << ", mounted_on=" << master_id_;
+    }
     ErrorCode err =
         cvm::EtcdViewStore::SaveSegmentDescriptor(cluster_id_, desc);
     if (err != ErrorCode::OK) {
@@ -4168,6 +4268,7 @@ ErrorCode MasterService::CheckSlotServiceability(uint16_t slot) const {
     return ErrorCode::SLOT_NOT_OWNED;
 }
 
+#ifdef STORE_USE_ETCD
 void MasterService::MaybeWarnGhostFallback(const char* where,
                                            uint16_t slot) const {
     // 幽灵写瞬态告警（§16.14.6 验证辅助）：模型曾启用（seen）但本 slot
@@ -4206,6 +4307,7 @@ void MasterService::MaybeWarnGhostFallback(const char* where,
                      << ", cached_group_count=" << group_count;
     }
 }
+#endif
 
 ErrorCode MasterService::CheckSlotWritable(uint16_t slot) const {
     // §16.19.3 写路径校验（读写分离）：ready/expected 判定复用读路径的
@@ -11076,6 +11178,7 @@ auto MasterService::ReportInvalidReplicaEndpoints(
             }
         }
     }
+#ifdef STORE_USE_ETCD
     {
         // etcd 兜底：对本地段表未命中的上报值，拉全量 SegmentDescriptor 按
         // te_endpoint / segment_name 匹配解析 UUID（quota snapshot 死段残留
@@ -11102,6 +11205,7 @@ auto MasterService::ReportInvalidReplicaEndpoints(
             }
         }
     }
+#endif
 
     size_t before = 0;
     size_t after = 0;

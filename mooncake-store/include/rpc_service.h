@@ -339,6 +339,11 @@ class WrappedMasterService {
     // wrapped MasterService for use by periodic admin metrics reporting.
     uint32_t GetOwnedSlotCount() const;
 
+    // One-line vsegment/psegment status summary (vsegment enabled state,
+    // quota generation/profiles, installed partitions, vsegment count and
+    // pool composition). Forwarded for the periodic VSegment Status log.
+    std::string GetVSegmentStatusLogLine() const;
+
     // Inter-master allocation forwarding (CVM plan B): allocate memory
     // replicas in this submaster's locally mounted segments on behalf of a
     // slot-owning peer. Strictly within `preferred_segments` when given.

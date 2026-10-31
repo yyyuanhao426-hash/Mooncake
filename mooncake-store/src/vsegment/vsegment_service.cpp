@@ -416,4 +416,27 @@ ErrorCode VSegmentService::LoadView(const std::string& partition_id,
     return ErrorCode::OK;
 }
 
+size_t VSegmentService::PartitionCount() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return partitions_.size();
+}
+
+size_t VSegmentService::VSegmentCount() {
+    std::vector<std::shared_ptr<VSegmentManager>> managers;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        managers.reserve(partitions_.size());
+        for (const auto& [id, manager] : partitions_) {
+            (void)id;
+            managers.push_back(manager);
+        }
+    }
+    size_t count = 0;
+    for (const auto& manager : managers) {
+        const auto stats = manager->Stats();
+        count += stats.active + stats.preparing;
+    }
+    return count;
+}
+
 }  // namespace mooncake::vsegment

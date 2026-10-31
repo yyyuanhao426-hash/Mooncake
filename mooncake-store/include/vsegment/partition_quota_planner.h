@@ -128,4 +128,10 @@ ErrorCode PlanAndPublishDiscoveredQuota(
     size_t max_etcd_value_bytes, std::string* detail = nullptr,
     std::string* out_summary_json = nullptr);
 
+// 配额发布成功后的「组成确定」可观测性日志（vsegment/psegment 术语）：
+// 从 etcd 回读刚发布的快照 + 段描述符，逐 profile 打印成员池清单
+// （psegment id@store(numaN)）。加载失败静默返回（发布日志已给出
+// summary，本函数只是增强，绝不反向影响发布路径）。
+void LogVSegmentPoolFormed(const std::string& cluster_namespace);
+
 }  // namespace mooncake::vsegment

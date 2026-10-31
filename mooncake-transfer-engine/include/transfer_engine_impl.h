@@ -274,9 +274,15 @@ class TransferEngineImpl {
 
     int probePeerAliveByID(SegmentID target_id);
 
+    // Read-only per-slice timing samples (observability); valid only after
+    // the task reached a terminal state. Forwarded to MultiTransport.
+    Status getSliceTimings(BatchID batch_id, size_t task_id,
+                           std::vector<Transport::SliceTiming>& timings) {
+        return multi_transports_->getSliceTimings(batch_id, task_id, timings);
+    }
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus& status) {
-        Status result =
+                             TransferStatus& status) {        Status result =
             multi_transports_->getTransferStatus(batch_id, task_id, status);
 #ifdef WITH_METRICS
         if (!metrics_enabled_ || !result.ok()) {

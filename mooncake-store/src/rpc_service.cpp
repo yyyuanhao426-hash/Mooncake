@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <sstream>
 #include <string_view>
 #include <type_traits>
 
@@ -16,6 +17,7 @@
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 #include "version.h"
+#include "vsegment/vsegment_metrics.h"
 
 namespace mooncake {
 namespace {
@@ -322,6 +324,57 @@ WrappedMasterService::GetReplicaList(const std::string& key,
                      << " key=" << key << " tenant=" << tenant_id
                      << " replica_count="
                      << (result ? result->replicas.size() : 0)
+                     << " latency_us=" << latency_us << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
+}
+
+tl::expected<vsegment::VSegmentView, ErrorCode>
+WrappedMasterService::GetVSegmentView(const std::string& partition_id,
+                                      const std::string& vsegment_id) {
+    // Server-side observability for the vsegment view RPC (sampled access
+    // log + SpDiag histogram). MasterService::GetVSegmentView is a cheap
+    // in-memory lookup; latency here reflects handler + serialization cost.
+    const bool sample = mooncake::logging::ShouldSampleHiFreqLog();
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    SpDiag::PerfPoint pt(PerfKey::MASTER_RPC_GET_VSEGMENT_VIEW,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
+    auto result = master_service_.GetVSegmentView(partition_id, vsegment_id);
+    pt.End(result ? 0 : -1);
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "GetVSegmentView partition=" << partition_id
+                     << " vsegment=" << vsegment_id << " latency_us="
+                     << latency_us << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
+}
+
+tl::expected<vsegment::PSegmentLocation, ErrorCode>
+WrappedMasterService::GetPSegmentEndpoint(const std::string& segment_id) {
+    // Server-side observability for the psegment endpoint RPC (sampled
+    // access log + SpDiag histogram). Cheap in-memory registry lookup.
+    const bool sample = mooncake::logging::ShouldSampleHiFreqLog();
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    SpDiag::PerfPoint pt(PerfKey::MASTER_RPC_GET_PSEGMENT_ENDPOINT,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
+    auto result = master_service_.GetPSegmentEndpoint(segment_id);
+    pt.End(result ? 0 : -1);
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "GetPSegmentEndpoint psegment=" << segment_id
                      << " latency_us=" << latency_us << " status="
                      << (result.has_value() ? "ok" : toString(result.error()));
     }
@@ -1980,6 +2033,49 @@ void WrappedMasterService::StopInterMasterRpc() {
 
 uint32_t WrappedMasterService::GetOwnedSlotCount() const {
     return master_service_.GetOwnedSlotCount();
+}
+
+// Keep the implementation and its forwarding wrapper in the same translation
+// unit so the shared library always emits the implementation with its caller.
+std::string MasterService::GetVSegmentStatusLogLine() const {
+    std::ostringstream os;
+    os << "VSegment Status: enabled=" << (vsegment_service_ ? 1 : 0);
+    if (vsegment_service_) {
+        const auto& snapshot = vsegment_service_->quota_snapshot();
+        const auto& metrics = vsegment::VSegmentMetrics::Instance();
+        os << ", generation=" << snapshot.config_generation
+           << ", profiles=" << snapshot.profile_specs.size()
+           << ", partitions_installed="
+           // PartitionCount/VSegmentCount 内部持 manager 锁，快照引用与
+           // metrics 读取均为锁外安全视图。
+           << vsegment_service_->PartitionCount()
+           << ", vsegments=" << vsegment_service_->VSegmentCount()
+           << ", logical_capacity=" << metrics.logical_capacity_bytes()
+           << ", logical_free=" << metrics.logical_free_bytes()
+           << " | pools=";
+        bool first_pool = true;
+        for (const auto& profile : snapshot.profile_specs) {
+            if (!first_pool) os << "; ";
+            first_pool = false;
+            // 成员数取 partition "0" 在该 profile 下的配额 extent 数
+            //（所有 partition 的成员集合相同）。
+            size_t member_count = 0;
+            for (const auto& quota : snapshot.quotas) {
+                if (quota.partition_id == "0" &&
+                    quota.profile_name == profile.name) {
+                    member_count = quota.extents.size();
+                    break;
+                }
+            }
+            os << profile.name << ":members=" << member_count
+               << ",medium=" << profile.required_medium;
+        }
+    }
+    return os.str();
+}
+
+std::string WrappedMasterService::GetVSegmentStatusLogLine() const {
+    return master_service_.GetVSegmentStatusLogLine();
 }
 
 tl::expected<InterMasterHandshakeResponse, ErrorCode>

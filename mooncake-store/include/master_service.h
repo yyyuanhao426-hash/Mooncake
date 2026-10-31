@@ -186,6 +186,11 @@ class MasterService {
     const std::string& master_id() const { return master_id_; }
     EtcdLeaseId cvm_lease_id() const { return cvm_lease_id_; }
     uint32_t GetOwnedSlotCount() const;
+
+    // vsegment/psegment 术语的单行状态摘要（enabled/generation/profiles/
+    // installed partitions/vsegment count/池组成），供 admin 周期日志线程
+    // 输出独立的 "VSegment Status" 行。
+    std::string GetVSegmentStatusLogLine() const;
     void SetVSegmentService(std::shared_ptr<vsegment::VSegmentService> service) {
         vsegment_service_ = std::move(service);
     }
@@ -2561,9 +2566,22 @@ class MasterService {
     // 心跳周期 reconcile 跳过本周期。冷启动（StartSlotOwnerHeartbeat
     // 初始调用，gate 置 true 之前）仍走同步路径，错误硬失败启动，与历史
     // 行为一致。
-    enum class VSegmentInitState { kIdle, kInProgress, kReady };
+    // kNoQuota: the quota snapshot is absent (vsegment disabled or not yet
+    // published). Slot readiness does NOT depend on vsegment in this state —
+    // the runtime gate must let slot imports proceed (mirrors the cold-start
+    // semantics of RefreshVSegmentOwnership for ETCD_KEY_NOT_EXIST). The
+    // background init thread keeps re-probing each heartbeat so a runtime
+    // quota publish (auto-plan / POST) transitions to kReady.
+    enum class VSegmentInitState { kIdle, kInProgress, kReady, kNoQuota };
     std::atomic<VSegmentInitState> vsegment_init_state_{
         VSegmentInitState::kIdle};
+    // Independent re-probe in-flight flag for the background init thread.
+    // Never encoded into vsegment_init_state_: encoding it (the kNoQuota ->
+    // kInProgress CAS) turned every slot-admission release into a full
+    // kInProgress window (init thread's etcd Get), throttling slot readiness
+    // to ~1 slot per heartbeat. With this flag the spawn path is invisible
+    // to the gate: kNoQuota stays kNoQuota while probing.
+    std::atomic<bool> vsegment_init_probe_in_flight_{false};
     std::thread vsegment_init_thread_;
     std::mutex vsegment_init_spawn_mutex_;  // 保护线程 spawn/join 生命周期
     // StartSlotOwnerHeartbeat 初始同步调用完成后置 true：此前的调用走同步

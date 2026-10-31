@@ -24,7 +24,12 @@ class WrappedMasterService;
 
 class MasterAdminServer {
    public:
-    MasterAdminServer(uint16_t http_port, bool enable_metric_reporting);
+    // metrics_log_interval_sec: period (seconds) of the admin metrics log
+    // thread, which emits both the "Master Admin Metrics" line and the
+    // periodic "VSegment Status" line. 0 falls back to
+    // kMetricReportIntervalSeconds; values are clamped to >= 1.
+    MasterAdminServer(uint16_t http_port, bool enable_metric_reporting,
+                      uint32_t metrics_log_interval_sec = 0);
 
     ~MasterAdminServer();
 
@@ -118,6 +123,7 @@ class MasterAdminServer {
 
     uint16_t http_port_;
     bool enable_metric_reporting_ = false;
+    uint64_t metrics_log_interval_sec_ = kMetricReportIntervalSeconds;
     coro_http::coro_http_server http_server_;
     std::thread metric_report_thread_;
     std::atomic<bool> metric_report_running_{false};

@@ -58,8 +58,13 @@ class MultiTransport {
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
-
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
+
+    // Read-only per-slice timing samples of one task (observability). Valid
+    // only after the task reached a terminal state; returns InvalidArgument
+    // on out-of-range task ids. Scheduler-owned batches are not supported.
+    Status getSliceTimings(BatchID batch_id, size_t task_id,
+                           std::vector<Transport::SliceTiming> &timings);
 
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);

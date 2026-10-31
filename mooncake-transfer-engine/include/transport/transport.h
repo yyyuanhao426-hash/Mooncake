@@ -28,6 +28,7 @@
 #include <string>
 #include <atomic>
 #include <functional>
+#include <time.h>  // For clock_gettime (Slice::done_ts stamping)
 #include <mutex>
 #include <condition_variable>
 
@@ -200,6 +201,15 @@ class Transport {
        public:
         void markSuccess() {
             status = Slice::SUCCESS;
+            // Completion timestamp (CLOCK_REALTIME ns, same clock as Slice::ts)
+            // for per-member latency observability. Stamped before publishing
+            // the slice's terminal state.
+            {
+                struct timespec now;
+                clock_gettime(CLOCK_REALTIME, &now);
+                done_ts = static_cast<int64_t>(now.tv_sec) * 1000000000ll +
+                          now.tv_nsec;
+            }
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
             __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
@@ -212,6 +222,12 @@ class Transport {
 
         void markFailed() {
             status = Slice::FAILED;
+            {
+                struct timespec now;
+                clock_gettime(CLOCK_REALTIME, &now);
+                done_ts = static_cast<int64_t>(now.tv_sec) * 1000000000ll +
+                          now.tv_nsec;
+            }
             __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
 
             check_batch_completion(true);
@@ -221,6 +237,9 @@ class Transport {
         }
 
         volatile int64_t ts;
+        // Completion timestamp (CLOCK_REALTIME ns); 0 until the slice reaches a
+        // terminal state via markSuccess/markFailed. duration = done_ts - ts.
+        volatile int64_t done_ts = 0;
 
        private:
         inline void check_batch_completion(bool is_failed) {
@@ -367,6 +386,16 @@ class Transport {
             for (auto &slice : slice_list)
                 Transport::getSliceCache().deallocate(slice);
         }
+    };
+
+    // Read-only per-slice timing sample for observability (valid only after
+    // the task reached a terminal state). duration_ns = done_ts - ts (0 when
+    // either timestamp is unset).
+    struct SliceTiming {
+        std::string peer_nic_path;
+        uint64_t length = 0;
+        int64_t post_ts = 0;
+        int64_t done_ts = 0;
     };
 
     struct BatchDesc {
