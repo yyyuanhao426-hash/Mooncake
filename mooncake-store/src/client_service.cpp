@@ -198,82 +198,6 @@ struct ReplicaTransferSummary {
     }
 };
 
-// vsegment 翻译层分段计时的 thread_local 累加器：Plan() 同步执行于调用
-// 线程，调用方在 Plan 前清零、Plan 后读取（见 TransferData vsegment 分支）。
-struct VSegPlanTiming {
-    int view_loads = 0;
-    uint64_t view_load_ns = 0;
-    int endpoint_rpcs = 0;
-    uint64_t endpoint_resolve_ns = 0;
-};
-thread_local VSegPlanTiming tl_vseg_plan_timing{};
-
-class MasterClientVSegmentViewProvider final
-    : public vsegment::VSegmentViewProvider {
-   public:
-    explicit MasterClientVSegmentViewProvider(MasterClient* master_client)
-        : master_client_(master_client) {}
-
-    ErrorCode LoadView(const std::string& partition_id,
-                       const std::string& vsegment_id,
-                       vsegment::VSegmentView* view,
-                       std::string* detail) override {
-        if (!master_client_ || !view) return ErrorCode::INVALID_PARAMS;
-        SpDiag::PerfPoint pt(PerfKey::VSEGMENT_VIEW_LOAD,
-                             SpDiag::PerfLevel::MODULE);
-        pt.Start();
-        const auto t0 = std::chrono::steady_clock::now();
-        auto result =
-            master_client_->GetVSegmentView(partition_id, vsegment_id);
-        tl_vseg_plan_timing.view_load_ns +=
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - t0)
-                .count();
-        ++tl_vseg_plan_timing.view_loads;
-        pt.End(result ? 0 : -1);
-        if (!result) {
-            if (detail) *detail = "failed to load vsegment view from owner";
-            return result.error();
-        }
-        *view = std::move(result.value());
-        return ErrorCode::OK;
-    }
-
-   private:
-    MasterClient* master_client_;
-};
-
-class MasterClientSegmentEndpointResolver final
-    : public vsegment::SegmentEndpointResolver {
-   public:
-    explicit MasterClientSegmentEndpointResolver(MasterClient* master_client)
-        : master_client_(master_client) {}
-
-    ErrorCode ResolveLocation(
-        const std::string& segment_id,
-        vsegment::PSegmentLocation* location) override {
-        if (!master_client_ || !location) return ErrorCode::INVALID_PARAMS;
-        SpDiag::PerfPoint pt(PerfKey::VSEGMENT_ENDPOINT_RESOLVE,
-                             SpDiag::PerfLevel::MODULE);
-        pt.Start();
-        const auto t0 = std::chrono::steady_clock::now();
-        auto result = master_client_->GetPSegmentEndpoint(segment_id);
-        tl_vseg_plan_timing.endpoint_resolve_ns +=
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - t0)
-                .count();
-        ++tl_vseg_plan_timing.endpoint_rpcs;
-        pt.End(result ? 0 : -1);
-        if (!result) return result.error();
-        *location = std::move(result.value());
-        return location->endpoint.empty() ? ErrorCode::INVALID_PARAMS
-                                          : ErrorCode::OK;
-    }
-
-   private:
-    MasterClient* master_client_;
-};
-
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary) {
     if (config.nof_replica_num == 0) {
@@ -1480,8 +1404,13 @@ namespace {
 std::shared_ptr<const std::vector<VSegmentLayoutEntry>> MakeVSegmentLayouts(
     const GetReplicaListResponse& response) {
     if (!response.vsegment_layouts.has_value()) return nullptr;
-    return std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+    SpDiag::PerfPoint pt(PerfKey::VSEGMENT_READ_LAYOUT_COPY,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
+    auto layouts = std::make_shared<const std::vector<VSegmentLayoutEntry>>(
         *response.vsegment_layouts);
+    pt.End(0);
+    return layouts;
 }
 }  // namespace
 
@@ -1570,7 +1499,15 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
         return results;
     }
     // 批量级别的去重表挂在第一个成功响应上（wire 类型不变，天然兼容）；
-    // 整个批次共享同一个 shared_ptr。旧 master 不带表 → 逐 key 回退。
+    // 整个批次共享同一个 shared_ptr。Hard C 不提供旧 RPC 回退，缺表会在
+    // planner 中按 SEGMENT_NOT_FOUND 失败。
+    const bool has_vsegment_layout =
+        std::any_of(response.begin(), response.end(), [](const auto& result) {
+            return result && result->vsegment_layouts.has_value();
+        });
+    SpDiag::PerfPoint pt_vsegment_layout_copy(
+        PerfKey::VSEGMENT_READ_LAYOUT_COPY, SpDiag::PerfLevel::MODULE);
+    if (has_vsegment_layout) pt_vsegment_layout_copy.Start();
     std::vector<VSegmentLayoutEntry> batch_layout_entries;
     MergeVSegmentLayoutTablesFromResults(response, batch_layout_entries);
     std::shared_ptr<const std::vector<VSegmentLayoutEntry>> batch_layouts;
@@ -1579,6 +1516,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             std::make_shared<const std::vector<VSegmentLayoutEntry>>(
                 std::move(batch_layout_entries));
     }
+    if (has_vsegment_layout) pt_vsegment_layout_copy.End(0);
     std::vector<tl::expected<QueryResult, ErrorCode>> results;
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
@@ -2092,15 +2030,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 client_slices.push_back(
                     {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
             }
+            SpDiag::PerfPoint pt_vsegment_plan(
+                PerfKey::VSEGMENT_READ_PLAN, SpDiag::PerfLevel::MODULE);
+            pt_vsegment_plan.Start();
             auto plan = vsegment_transfer_planner_->Plan(
                 replica.get_vsegment_descriptor(), client_slices,
                 query_result.vsegment_layouts.get());
+            pt_vsegment_plan.End(plan ? 0 : -1);
             if (!plan) {
                 results[i] = tl::unexpected(plan.error);
                 continue;
             }
+            SpDiag::PerfPoint pt_vsegment_submit(
+                PerfKey::VSEGMENT_READ_SUBMIT, SpDiag::PerfLevel::MODULE);
+            pt_vsegment_submit.Start();
             future = transfer_submitter_->submitVSegment(
                 plan, TransferRequest::READ);
+            pt_vsegment_submit.End(future ? 0 : -1);
         } else if (replica.is_nof_replica()) {
             auto contiguous_range = GetContiguousSliceRange(slices_it->second);
             if (!contiguous_range.has_value()) {
@@ -2144,7 +2090,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     pt_wait.Start();
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
+        const bool is_vsegment = stored_replica.is_vsegment_replica();
+        SpDiag::PerfPoint pt_vsegment_wait(
+            PerfKey::VSEGMENT_READ_WAIT, SpDiag::PerfLevel::MODULE);
+        if (is_vsegment) pt_vsegment_wait.Start();
         ErrorCode result = future.get();
+        if (is_vsegment) {
+            pt_vsegment_wait.End(result == ErrorCode::OK ? 0 : -1);
+        }
 
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
@@ -5093,6 +5046,10 @@ ErrorCode Client::TransferData(
                                 SpDiag::PerfLevel::MODULE);
     SpDiag::PerfPoint pt_wait(PerfKey::GET_SINGLE_TRANSFER_WAIT,
                               SpDiag::PerfLevel::MODULE);
+    const bool is_vsegment_read =
+        is_read && replica_descriptor.is_vsegment_replica();
+    SpDiag::PerfPoint pt_vsegment_wait(
+        PerfKey::VSEGMENT_READ_WAIT, SpDiag::PerfLevel::MODULE);
     if (is_read) pt_full.Start();
 
     if (!transfer_submitter_) {
@@ -5117,29 +5074,15 @@ ErrorCode Client::TransferData(
             client_slices.push_back(
                 {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
         }
-        // 翻译层分解计时：provider/resolver 在本线程内的 RPC 次数与耗时由
-        // thread_local 累加器收集（Plan 前清零、Plan 后读取，见 provider/
-        // resolver 定义处），配 SpDiag 直方图与采样 breakdown 日志。
-        tl_vseg_plan_timing = {};
-        SpDiag::PerfPoint pt_plan(PerfKey::VSEGMENT_READ_PLAN,
-                                  SpDiag::PerfLevel::MODULE);
-        if (is_read) pt_plan.Start();
+        // Hard C 的读路径只依赖响应内联 layout；这里统计 layout 查找/校验、
+        // 条带拆分和 endpoint 映射，不再统计已删除的 view/endpoint RPC。
+        SpDiag::PerfPoint pt_vsegment_plan(
+            PerfKey::VSEGMENT_READ_PLAN, SpDiag::PerfLevel::MODULE);
+        if (is_read) pt_vsegment_plan.Start();
         auto plan = vsegment_transfer_planner_->Plan(
-            replica_descriptor.get_vsegment_descriptor(), client_slices);
-        if (is_read) {
-            pt_plan.End(plan ? 0 : -1);
-            if (mooncake::logging::ShouldSampleHiFreqLog()) {
-                MC_LOG(INFO)
-                    << "vsegment_read_breakdown view_loads="
-                    << tl_vseg_plan_timing.view_loads << " view_load_us="
-                    << tl_vseg_plan_timing.view_load_ns / 1000
-                    << " endpoint_rpcs=" << tl_vseg_plan_timing.endpoint_rpcs
-                    << " endpoint_resolve_us="
-                    << tl_vseg_plan_timing.endpoint_resolve_ns / 1000
-                    << " subrequests="
-                    << (plan ? plan.requests.size() : 0);
-            }
-        }
+            replica_descriptor.get_vsegment_descriptor(), client_slices,
+            layouts);
+        if (is_read) pt_vsegment_plan.End(plan ? 0 : -1);
         if (!plan) {
             LOG(ERROR) << "Failed to plan vsegment transfer: " << plan.detail;
             if (is_read) pt_full.End(-1);
@@ -5148,8 +5091,12 @@ ErrorCode Client::TransferData(
         for (const auto& subrequest : plan.requests) {
             vsegment_plan_endpoints.push_back(subrequest.endpoint);
         }
+        SpDiag::PerfPoint pt_vsegment_submit(
+            PerfKey::VSEGMENT_READ_SUBMIT, SpDiag::PerfLevel::MODULE);
         if (is_read) pt_submit.Start();
+        if (is_read) pt_vsegment_submit.Start();
         future = transfer_submitter_->submitVSegment(plan, op_code);
+        if (is_read) pt_vsegment_submit.End(future ? 0 : -1);
         if (is_read) pt_submit.End(future ? 0 : -1);
     } else if (replica_descriptor.is_nof_replica()) {
         auto contiguous_range = GetContiguousSliceRange(slices);
@@ -5183,6 +5130,7 @@ ErrorCode Client::TransferData(
     VLOG(1) << "Using transfer strategy: " << future->strategy();
 
     if (is_read) pt_wait.Start();
+    if (is_vsegment_read) pt_vsegment_wait.Start();
     const ErrorCode transfer_result = future->get();
     if (transfer_result != ErrorCode::OK && failed_endpoints) {
         for (const auto& endpoint : vsegment_plan_endpoints) {
@@ -5191,6 +5139,7 @@ ErrorCode Client::TransferData(
     }
     if (is_read) {
         const int pt_status = (transfer_result == ErrorCode::OK) ? 0 : -1;
+        if (is_vsegment_read) pt_vsegment_wait.End(pt_status);
         pt_wait.End(pt_status);
         pt_full.End(pt_status);
     }
@@ -5226,12 +5175,26 @@ ErrorCode Client::TransferReadInternal(
             return ErrorCode::INVALID_PARAMS;
         replica.logical_offset += src_offset;
         replica.length = length;
+        SpDiag::PerfPoint pt_vsegment_plan(
+            PerfKey::VSEGMENT_READ_PLAN, SpDiag::PerfLevel::MODULE);
+        pt_vsegment_plan.Start();
         auto plan =
             vsegment_transfer_planner_->Plan(replica, client_slices, layouts);
+        pt_vsegment_plan.End(plan ? 0 : -1);
         if (!plan) return plan.error;
+        SpDiag::PerfPoint pt_vsegment_submit(
+            PerfKey::VSEGMENT_READ_SUBMIT, SpDiag::PerfLevel::MODULE);
+        pt_vsegment_submit.Start();
         auto future = transfer_submitter_->submitVSegment(
             plan, TransferRequest::READ);
-        return future ? future->get() : ErrorCode::TRANSFER_FAIL;
+        pt_vsegment_submit.End(future ? 0 : -1);
+        if (!future) return ErrorCode::TRANSFER_FAIL;
+        SpDiag::PerfPoint pt_vsegment_wait(
+            PerfKey::VSEGMENT_READ_WAIT, SpDiag::PerfLevel::MODULE);
+        pt_vsegment_wait.Start();
+        const ErrorCode result = future->get();
+        pt_vsegment_wait.End(result == ErrorCode::OK ? 0 : -1);
+        return result;
     }
 
     auto future = transfer_submitter_->submitRangeRead(replica_descriptor,

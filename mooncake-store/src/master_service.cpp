@@ -7599,7 +7599,11 @@ void MasterService::EnrichVSegmentLayouts(GetReplicaListResponse* response) {
                                descriptor.vsegment_id);
     }
     if (vsegments.empty()) return;
+    SpDiag::PerfPoint pt(PerfKey::VSEGMENT_READ_LAYOUT_BUILD,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
     auto layouts = BuildVSegmentLayoutTable(vsegments);
+    pt.End(layouts.empty() ? -1 : 0);
     if (!layouts.empty()) {
         response->vsegment_layouts = std::move(layouts);
     }
@@ -7727,7 +7731,11 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
     }
     if (!local_vsegments.empty()) {
+        SpDiag::PerfPoint pt(PerfKey::VSEGMENT_READ_LAYOUT_BUILD,
+                             SpDiag::PerfLevel::MODULE);
+        pt.Start();
         auto local_layouts = BuildVSegmentLayoutTable(local_vsegments);
+        pt.End(local_layouts.empty() ? -1 : 0);
         MergeVSegmentLayoutTable(layouts, local_layouts);
     }
     // 批量级别没有独立 envelope（类型码不允许），去重表挂到第一个成功项。
