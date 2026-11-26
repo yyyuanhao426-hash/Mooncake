@@ -2971,6 +2971,8 @@ class MasterService {
     bool AdmitsBusinessWorkers() const;
 
     // Discarded replicas management
+    // Both configured timeouts zero opt into lease-bypassing memory upserts.
+    const bool force_inplace_upsert_;
     const std::chrono::seconds put_start_discard_timeout_sec_;
     const std::chrono::seconds put_start_release_timeout_sec_;
     class DiscardedReplicas {

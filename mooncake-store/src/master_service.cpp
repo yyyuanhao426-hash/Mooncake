@@ -639,8 +639,14 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                     : config.allocation_strategy_type),
       allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_,
                                                     local_ssd_manager_)),
-      put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
-      put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
+      force_inplace_upsert_(config.put_start_discard_timeout_sec == 0 &&
+                            config.put_start_release_timeout_sec == 0),
+      put_start_discard_timeout_sec_(force_inplace_upsert_
+                                         ? DEFAULT_PUT_START_DISCARD_TIMEOUT
+                                         : config.put_start_discard_timeout_sec),
+      put_start_release_timeout_sec_(force_inplace_upsert_
+                                         ? DEFAULT_PUT_START_RELEASE_TIMEOUT
+                                         : config.put_start_release_timeout_sec),
       offloading_queue_limit_(config.offloading_queue_limit),
       task_manager_(config.task_manager_config),
       batch_oplog_writer_factory_(
@@ -10823,6 +10829,9 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
 // are moved to discarded_replicas_ for delayed release (the previous writer
 // may still be performing RDMA writes to those buffers).
 //
+// Both configured put_start timeouts zero enable same-size memory in-place
+// updates even with read leases. Cleanup still uses the default timeouts and
+// concurrent writers are rejected; existing readers can see overwritten data.
 // Note: during Case B the key is temporarily unreadable (all replicas are
 // PROCESSING).  Readers will get REPLICA_IS_NOT_READY until UpsertEnd.
 auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
@@ -10971,6 +10980,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // the old writer may still be doing RDMA writes.  Unlike
                 // PutStart (which only preempts after a timeout), UpsertStart
                 // preempts immediately.
+                if (state.is_processing && force_inplace_upsert_) {
+                    // Never reuse or retire buffers still owned by a writer.
+                    return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
+                }
                 if (state.is_processing) {
                     // Abort the preempted writer's VSegment reservations;
                     // the raw pop below only detaches the replicas.
@@ -11077,7 +11090,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     }
                 }
 
-                const bool has_read_lease = !metadata.IsLeaseExpired(now);
+                // Explicit benchmark mode: overwrite same-size memory buffers
+                // despite outstanding read leases. Readers with previously
+                // issued descriptors may observe a concurrent overwrite.
+                const bool force_memory_inplace =
+                    force_inplace_upsert_ &&
+                    metadata.TotalLength() == slice_length &&
+                    metadata.AllReplicas(&Replica::fn_is_memory_replica);
+                const bool has_read_lease =
+                    !force_memory_inplace && !metadata.IsLeaseExpired(now);
                 if (has_read_lease &&
                     metadata.HasReplica([](const Replica& replica) {
                         return !replica.is_memory_replica() &&

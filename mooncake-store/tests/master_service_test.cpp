@@ -1844,6 +1844,60 @@ TEST_F(MasterServiceTest,
     std::filesystem::remove_all(dfs_root, ec);
 }
 
+TEST_F(MasterServiceTest, ZeroTimeoutUpsertReusesLeasedMemory) {
+    MasterServiceConfig service_config;
+    service_config.memory_allocator = BufferAllocatorType::OFFSET;
+    service_config.default_kv_lease_ttl = 500;
+    service_config.put_start_discard_timeout_sec = 0;
+    service_config.put_start_release_timeout_sec = 0;
+    MasterService service(service_config);
+
+    // Fill the segment: a replacement allocation cannot succeed.
+    constexpr size_t kSegmentSize = 1024 * 1024;
+    const auto context = PrepareSimpleSegment(
+        service, "zero_timeout_upsert_segment", kDefaultSegmentBase,
+        kSegmentSize);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "zero_timeout_upsert";
+    auto initial = service.PutStart(context.client_id, key, TenantId::Default(),
+                                    kSegmentSize, config);
+    ASSERT_TRUE(initial.has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, key, TenantId::Default(),
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE(service.GetReplicaList(key, TenantId::Default()).has_value());
+        auto update = service.UpsertStart(context.client_id, key,
+                                          TenantId::Default(), kSegmentSize,
+                                          config);
+        ASSERT_TRUE(update.has_value());
+        ASSERT_EQ(update->size(), initial->size());
+        const auto old_address = (*initial)[0]
+                                     .get_memory_descriptor()
+                                     .buffer_descriptor.buffer_address_;
+        const auto new_address = (*update)[0]
+                                     .get_memory_descriptor()
+                                     .buffer_descriptor.buffer_address_;
+        EXPECT_EQ(new_address, old_address);
+
+        auto concurrent = service.UpsertStart(context.client_id, key,
+                                              TenantId::Default(), kSegmentSize,
+                                              config);
+        ASSERT_FALSE(concurrent.has_value());
+        EXPECT_EQ(concurrent.error(), ErrorCode::OBJECT_REPLICA_BUSY);
+        auto reading = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(reading.has_value());
+        EXPECT_EQ(reading.error(), ErrorCode::REPLICA_IS_NOT_READY);
+        ASSERT_TRUE(service
+                        .UpsertEnd(context.client_id, key, TenantId::Default(),
+                                   ReplicaType::MEMORY)
+                        .has_value());
+    }
+}
+
 TEST_F(MasterServiceTest, LeasedUpsertAllocationFailurePreservesObject) {
     MasterServiceConfig service_config;
     service_config.memory_allocator = BufferAllocatorType::OFFSET;
