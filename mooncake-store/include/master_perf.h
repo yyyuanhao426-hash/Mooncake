@@ -9,4 +9,4 @@
 
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
 #define SPDIAG_PROGRAM_NAME mooncake::SpDiagProgramName("mooncake_master")
-#include "spdiag/auto_perf.h"
+#include "mooncake_spdiag.h"

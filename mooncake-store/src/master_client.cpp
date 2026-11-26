@@ -42,7 +42,7 @@
 #define SPDIAG_PROGRAM_NAME mooncake::SpDiagProgramName("mooncake_store")
 
 #include <optional>
-#include "spdiag/auto_perf.h"
+#include "mooncake_spdiag.h"
 
 #if defined(MOONCAKE_RPC_SUBMIT_DIAG_BUILD) && \
     !defined(MOONCAKE_RPC_SUBMIT_TRACE_VERSION)
