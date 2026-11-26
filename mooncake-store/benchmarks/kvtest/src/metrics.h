@@ -1,5 +1,8 @@
 #pragma once
 
+#include "tdigest.h"
+#include <array>
+#include <limits>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -38,12 +41,13 @@ struct MetricSnapshot {
 
 class MetricsCollector {
    public:
-    // samples_max caps retained latency samples per operation using streaming
-    // decimation (keep every 2nd sample when the cap is hit). 0 = unlimited.
+    // samples_max is accepted for source compatibility; t-digest replaces
+    // whole-run sample retention and does not decimate requests.
     MetricsCollector(int instance_id, int interval_ms, std::string output_dir,
-                     uint64_t samples_max = 0);
+                     uint64_t samples_max = 0, bool record_raw_samples = false);
     ~MetricsCollector();
 
+    void SetReportWindow(double start, double end);
     void Start();
     void Reset();
     void ResetPaused();
@@ -92,23 +96,29 @@ class MetricsCollector {
         // Continuous sum of successful interface latencies (not sampled), used
         // for MCP-style busy throughput.
         double success_latency_ms_sum{0};
-        // One in-memory row per measured operation. The request path never
-        // writes a file; Stop() emits the complete sample set in one batch.
-        std::vector<RequestSample> samples;
+        // Bounded whole-run distribution plus exact successful-call moments.
+        TDigest digest;
+        double min_ms{std::numeric_limits<double>::infinity()};
+        double max_ms{0};
+        std::array<uint64_t, 8> over_us{};
         // Samples since the last window flush (metrics_<id>.csv).
         std::vector<RequestSample> window_samples;
-        uint64_t stride{1};
+        std::vector<RequestSample> raw_samples;
     };
 
     std::shared_ptr<OperationMetrics> GetOrCreate(const std::string &operation);
-    void WriteSamples();
-    void MaybeDecimate(OperationMetrics *metric);
+
     void FlushLoop();
     void FlushWindows();
+    void WriteRawSamples();
 
+    std::unique_ptr<MetricsCollector> report_;
+    double report_start_{0};
+    double report_end_{0};
     int instance_id_;
     std::string output_dir_;
     uint64_t samples_max_{0};
+    bool record_raw_samples_{false};
     std::string summary_extra_;
     uint64_t generation_{0};
     int interval_ms_{3000};

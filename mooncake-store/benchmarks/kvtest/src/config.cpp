@@ -232,6 +232,16 @@ bool LoadConfig(const std::string &path, Config *config, std::string *error) {
         cfg.scope = root.get("scope", cfg.scope).asString();
         cfg.prefill_batch =
             root.get("prefill_batch", cfg.prefill_batch).asInt();
+        cfg.report_start_s = root.get("report_start_s", 0.0).asDouble();
+        if (root.isMember("record_raw_samples") && !root["record_raw_samples"].isBool())
+            throw std::runtime_error("record_raw_samples must be a boolean");
+        cfg.record_raw_samples = root.get("record_raw_samples", false).asBool();
+        cfg.report_end_s = root.get("report_end_s", 0.0).asDouble();
+        if (!std::isfinite(cfg.report_start_s) || !std::isfinite(cfg.report_end_s) ||
+            cfg.report_start_s < 0 || cfg.report_end_s < 0 ||
+            ((cfg.report_start_s > 0 || cfg.report_end_s > 0) &&
+             cfg.report_end_s <= cfg.report_start_s))
+            throw std::runtime_error("invalid digest report window");
         cfg.samples_max = static_cast<uint64_t>(
             root.get("samples_max", static_cast<Json::UInt64>(cfg.samples_max))
                 .asUInt64());

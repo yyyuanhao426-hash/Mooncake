@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace mooncake::kvtest {
@@ -34,27 +35,6 @@ double Percentile(const std::vector<double> &sorted, double percentile) {
     const auto rank = static_cast<size_t>(std::llround(
         percentile * static_cast<double>(sorted.size() - 1)));
     return sorted[rank];
-}
-
-Json::Value LatencyJson(std::vector<double> values) {
-    Json::Value result(Json::objectValue);
-    if (values.empty()) {
-        result["count"] = Json::UInt64(0);
-        return result;
-    }
-    std::sort(values.begin(), values.end());
-    double sum = 0;
-    for (double value : values) sum += value;
-    result["count"] = static_cast<Json::UInt64>(values.size());
-    result["avg_ms"] = sum / values.size();
-    result["min_ms"] = values.front();
-    result["p50_ms"] = Percentile(values, 0.50);
-    result["p90_ms"] = Percentile(values, 0.90);
-    result["p99_ms"] = Percentile(values, 0.99);
-    result["p999_ms"] = Percentile(values, 0.999);
-    result["p9999_ms"] = Percentile(values, 0.9999);
-    result["max_ms"] = values.back();
-    return result;
 }
 
 std::string JsonString(const Json::Value &value) {
@@ -96,14 +76,22 @@ const char *StatusName(RecordStatus status) {
 
 MetricsCollector::MetricsCollector(int instance_id, int interval_ms,
                                    std::string output_dir,
-                                   uint64_t samples_max)
+                                   uint64_t samples_max, bool record_raw_samples)
     : instance_id_(instance_id),
       output_dir_(std::move(output_dir)),
       samples_max_(samples_max),
+      record_raw_samples_(record_raw_samples),
       generation_(NextGeneration()),
       interval_ms_(std::max(0, interval_ms)) {}
 
 MetricsCollector::~MetricsCollector() { Stop(); }
+
+void MetricsCollector::SetReportWindow(double start, double end) {
+    report_start_ = start;
+    report_end_ = end;
+    report_ = std::make_unique<MetricsCollector>(
+        instance_id_, 0, (std::filesystem::path(output_dir_) / "report").string());
+}
 
 void MetricsCollector::SetSummaryExtra(std::string extra) {
     std::lock_guard<std::mutex> lock(operations_mutex_);
@@ -111,7 +99,10 @@ void MetricsCollector::SetSummaryExtra(std::string extra) {
 }
 
 void MetricsCollector::Start() {
+    if (report_) report_->Start();
     std::filesystem::create_directories(output_dir_);
+    // Do not let an old raw-sample file masquerade as this run's data.
+    std::filesystem::remove(std::filesystem::path(output_dir_) / "latency_samples.csv");
     process_start_us_ = SteadyNowUs();
     last_flush_us_.store(process_start_us_, std::memory_order_release);
     if (interval_ms_ > 0) {
@@ -141,6 +132,7 @@ void MetricsCollector::Reset() {
 }
 
 void MetricsCollector::ResetPaused() {
+    if (report_) report_->ResetPaused();
     recording_.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> operations_lock(operations_mutex_);
     for (const auto &[name, metric] : operations_) {
@@ -155,9 +147,12 @@ void MetricsCollector::ResetPaused() {
         metric->error.store(0, std::memory_order_relaxed);
         metric->warmup.store(0, std::memory_order_relaxed);
         metric->success_latency_ms_sum = 0.0;
-        metric->samples.clear();
+        metric->digest = TDigest();
+        metric->min_ms = std::numeric_limits<double>::infinity();
+        metric->max_ms = 0;
+        metric->over_us.fill(0);
         metric->window_samples.clear();
-        metric->stride = 1;
+        metric->raw_samples.clear();
     }
     verify_failures_.store(0, std::memory_order_relaxed);
     start_time_us_.store(0, std::memory_order_release);
@@ -165,6 +160,7 @@ void MetricsCollector::ResetPaused() {
 }
 
 void MetricsCollector::BeginMeasurement() {
+    if (report_) report_->BeginMeasurement();
     last_flush_us_.store(SteadyNowUs(), std::memory_order_release);
     start_time_us_.store(SteadyNowUs(), std::memory_order_release);
     end_time_us_.store(0, std::memory_order_release);
@@ -172,6 +168,7 @@ void MetricsCollector::BeginMeasurement() {
 }
 
 void MetricsCollector::Freeze() {
+    if (report_) report_->Freeze();
     if (!recording_.exchange(false, std::memory_order_acq_rel)) return;
     // Wait for records that passed the pre-lock recording check so the frozen
     // elapsed time and counters describe the same completed interval.
@@ -203,7 +200,7 @@ void MetricsCollector::Stop() {
         flush_thread_.join();
     }
     Freeze();
-    WriteSamples();
+    if (record_raw_samples_) WriteRawSamples();
     WriteSummary();
     std::lock_guard<std::mutex> lock(flush_mutex_);
     if (window_file_.is_open()) {
@@ -235,17 +232,6 @@ MetricsCollector::GetOrCreate(const std::string &operation) {
     if (!entry) entry = std::make_shared<OperationMetrics>();
     collector_cache.second.emplace(operation, entry);
     return entry;
-}
-
-void MetricsCollector::MaybeDecimate(OperationMetrics *metric) {
-    if (samples_max_ < 2 || metric->samples.size() < samples_max_) return;
-    std::vector<RequestSample> compact;
-    compact.reserve((metric->samples.size() + 1) / 2);
-    for (size_t i = 0; i < metric->samples.size(); i += 2) {
-        compact.push_back(metric->samples[i]);
-    }
-    metric->samples.swap(compact);
-    metric->stride *= 2;
 }
 
 void MetricsCollector::FlushLoop() {
@@ -378,6 +364,12 @@ void MetricsCollector::Record(const std::string &operation, double latency_ms,
                               int32_t code, bool warmup) {
     if (!recording_.load(std::memory_order_acquire)) return;
     const int64_t recorded_us = SteadyNowUs();
+    if (report_) {
+        const double elapsed = static_cast<double>(recorded_us -
+            start_time_us_.load(std::memory_order_acquire)) / 1000000.0;
+        if (elapsed >= report_start_ && elapsed < report_end_)
+            report_->Record(operation, latency_ms, status, bytes, code, warmup);
+    }
     auto metric = GetOrCreate(operation);
     std::lock_guard<std::mutex> lock(metric->latency_mutex);
     if (!recording_.load(std::memory_order_acquire)) return;
@@ -389,11 +381,18 @@ void MetricsCollector::Record(const std::string &operation, double latency_ms,
 
     metric->total.fetch_add(1, std::memory_order_relaxed);
     switch (status) {
-        case RecordStatus::kOk:
+        case RecordStatus::kOk: {
             metric->success.fetch_add(1, std::memory_order_relaxed);
             metric->bytes.fetch_add(bytes, std::memory_order_relaxed);
             metric->success_latency_ms_sum += latency_ms;
+            metric->digest.Add(latency_ms);
+            metric->min_ms = std::min(metric->min_ms, latency_ms);
+            metric->max_ms = std::max(metric->max_ms, latency_ms);
+            constexpr int thresholds[] = {2000, 5000, 6000, 7000, 8000, 9000, 10000, 20000};
+            for (size_t i = 0; i < metric->over_us.size(); ++i)
+                if (latency_ms * 1000 > thresholds[i]) ++metric->over_us[i];
             break;
+        }
         case RecordStatus::kMiss:
             metric->failure.fetch_add(1, std::memory_order_relaxed);
             metric->miss.fetch_add(1, std::memory_order_relaxed);
@@ -411,11 +410,35 @@ void MetricsCollector::Record(const std::string &operation, double latency_ms,
     }
 
     const int64_t start = start_time_us_.load(std::memory_order_acquire);
-    MaybeDecimate(metric.get());
+
     RequestSample sample{std::max<int64_t>(0, recorded_us - start),
                          latency_ms, status, bytes, code};
-    metric->samples.push_back(sample);
+
     if (interval_ms_ > 0) metric->window_samples.push_back(sample);
+    if (record_raw_samples_) metric->raw_samples.push_back(sample);
+}
+
+void MetricsCollector::WriteRawSamples() {
+    std::ofstream output(std::filesystem::path(output_dir_) / "latency_samples.csv");
+    output << "elapsed_us,instance_id,operation,request_index,latency_ms,status,bytes\n";
+    std::lock_guard<std::mutex> operations_lock(operations_mutex_);
+    for (auto &[name, metric] : operations_) {
+        std::lock_guard<std::mutex> lock(metric->latency_mutex);
+        auto &samples = metric->raw_samples;
+        std::stable_sort(samples.begin(), samples.end(), [](const auto &a, const auto &b) {
+            return a.elapsed_us < b.elapsed_us;
+        });
+        for (size_t i = 0; i < samples.size(); ++i) {
+            const auto &s = samples[i];
+            std::string status = StatusName(s.status);
+            if (s.status == RecordStatus::kError && s.code != 0)
+                status += ":" + std::to_string(s.code);
+            output << s.elapsed_us << ',' << instance_id_ << ',' << name << ',' << i
+                   << ',' << std::setprecision(17) << s.latency_ms << ','
+                   << status << ',' << s.bytes << '\n';
+        }
+    }
+    if (!output) throw std::runtime_error("failed to write latency_samples.csv");
 }
 
 void MetricsCollector::RecordVerifyFailure() {
@@ -500,40 +523,6 @@ std::string MetricsCollector::StatsJson() const {
     return JsonString(root);
 }
 
-void MetricsCollector::WriteSamples() {
-    std::vector<std::pair<std::string, std::shared_ptr<OperationMetrics>>> ops;
-    {
-        std::lock_guard<std::mutex> lock(operations_mutex_);
-        for (const auto &entry : operations_) ops.push_back(entry);
-    }
-    std::ofstream output(std::filesystem::path(output_dir_) /
-                         "latency_samples.csv");
-    output << "elapsed_us,instance_id,operation,request_index,latency_ms,"
-              "status,bytes\n";
-    for (const auto &[name, metric] : ops) {
-        std::vector<RequestSample> samples;
-        {
-            std::lock_guard<std::mutex> lock(metric->latency_mutex);
-            samples = metric->samples;
-        }
-        std::stable_sort(samples.begin(), samples.end(),
-                         [](const auto &a, const auto &b) {
-                             return a.elapsed_us < b.elapsed_us;
-                         });
-        for (size_t i = 0; i < samples.size(); ++i) {
-            const auto &sample = samples[i];
-            std::string status = StatusName(sample.status);
-            if (sample.status == RecordStatus::kError && sample.code != 0) {
-                status += ":" + std::to_string(sample.code);
-            }
-            output << sample.elapsed_us << ',' << instance_id_ << ',' << name
-                   << ',' << i << ',' << std::fixed << std::setprecision(6)
-                   << sample.latency_ms << ',' << status << ',' << sample.bytes
-                   << '\n';
-        }
-    }
-}
-
 void MetricsCollector::WriteSummary() {
     Json::Value root(Json::objectValue);
     root["instance_id"] = instance_id_;
@@ -544,21 +533,35 @@ void MetricsCollector::WriteSummary() {
     uint64_t warmup_total = 0;
     std::lock_guard<std::mutex> lock(operations_mutex_);
     for (const auto &[name, metric] : operations_) {
-        std::vector<double> latencies;
+        Json::Value op(Json::objectValue);
         double busy_ms = 0.0;
         {
             std::lock_guard<std::mutex> latency_lock(metric->latency_mutex);
-            latencies.reserve(metric->samples.size());
-            for (const auto &sample : metric->samples) {
-                // Latency percentiles (and throughput) only describe
-                // successful operations, matching the Python client.
-                if (sample.status == RecordStatus::kOk) {
-                    latencies.push_back(sample.latency_ms);
-                }
-            }
             busy_ms = metric->success_latency_ms_sum;
+            const auto count = metric->success.load();
+            op["count"] = Json::UInt64(count);
+            op["latency_sum_ms"] = busy_ms;
+            op["avg_ms"] = count ? busy_ms / count : 0.0;
+            op["min_ms"] = count ? metric->min_ms : 0.0;
+            op["max_ms"] = count ? metric->max_ms : 0.0;
+            const char *names[] = {"p50_ms", "p90_ms", "p95_ms", "p99_ms", "p999_ms", "p9999_ms"};
+            const double qs[] = {.5, .9, .95, .99, .999, .9999};
+            for (size_t i = 0; i < 6; ++i) op[names[i]] = metric->digest.Quantile(qs[i]);
+            Json::Value digest(Json::objectValue), centroids(Json::arrayValue);
+            digest["compression"] = 1000;
+            digest["unit"] = "ms";
+            for (const auto &c : metric->digest.Centroids()) {
+                Json::Value pair(Json::arrayValue);
+                pair.append(c.mean);
+                pair.append(c.weight);
+                centroids.append(pair);
+            }
+            digest["centroids"] = centroids;
+            op["digest"] = digest;
+            const int thresholds[] = {2000, 5000, 6000, 7000, 8000, 9000, 10000, 20000};
+            for (size_t i = 0; i < 8; ++i)
+                op[">" + std::to_string(thresholds[i]) + "us"] = Json::UInt64(metric->over_us[i]);
         }
-        auto op = LatencyJson(std::move(latencies));
         op["total"] = static_cast<Json::UInt64>(
             metric->total.load(std::memory_order_relaxed));
         op["success"] = static_cast<Json::UInt64>(
@@ -599,6 +602,25 @@ void MetricsCollector::WriteSummary() {
     }
     root["operations"] = std::move(operations);
     root["warmup_total"] = static_cast<Json::UInt64>(warmup_total);
+    root["statistics_format"] = "tdigest-v1";
+    root["record_raw_samples"] = record_raw_samples_;
+    if (report_) {
+        report_->WriteSummary();
+        std::ifstream report_file(std::filesystem::path(output_dir_) / "report" / "summary.json");
+        Json::Value report_doc;
+        report_file >> report_doc;
+        report_doc["start_s"] = report_start_;
+        report_doc["end_s"] = report_end_;
+        report_doc["elapsed_seconds"] = std::max(0.0, std::min(ElapsedSeconds(), report_end_) - report_start_);
+        const double wall = report_doc["elapsed_seconds"].asDouble();
+        for (const auto &name : report_doc["operations"].getMemberNames()) {
+            auto &op = report_doc["operations"][name];
+            const double mb_s = wall > 0 ? op["bytes"].asDouble() / wall / (1024.0 * 1024.0) : 0;
+            op["throughput_mb_s"] = mb_s;
+            op["throughput_gb_s"] = mb_s / 1024.0;
+        }
+        root["report_window"] = report_doc;
+    }
     ApplySummaryExtra(summary_extra_, &root);
     std::ofstream output(std::filesystem::path(output_dir_) / "summary.json");
     Json::StreamWriterBuilder builder;

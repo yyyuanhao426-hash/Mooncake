@@ -8,6 +8,28 @@ not part of the request path. Peer notifications can use either HTTP or YLT
 
 ## Build
 
+Latency statistics use a mergeable t-digest (arcsine scale, compression 1000),
+with bounded whole-run memory. `summary.json` exports `statistics_format:
+tdigest-v1` and, for each operation, centroid `[mean_ms, weight]` pairs.
+Successful measured calls contribute to latency statistics; warmup calls are
+excluded and failed calls are counted separately. Exact accumulators retain
+min/avg/max, successful latency sum, counts/bytes, and strict `>` counts at
+2000/5000/6000/7000/8000/9000/10000/20000 microseconds. P50/P90/P95/P99/P99.9/
+P99.99 are approximate digest quantiles. `samples_max` is now ignored.
+
+`latency_samples.csv` is disabled by default. Set `record_raw_samples=true`
+in the native JSON to additionally retain every measured request and write
+the complete CSV at shutdown. Digest statistics are always collected in
+parallel. Raw recording increases memory with request count; `samples_max`
+does not subsample or cap this opt-in full recording. Warmup is excluded.
+Optional interval CSV retains
+only one flush interval of raw values, not the full run. With the default
+`metrics_interval_ms=0`, no raw values are retained. For a bounded-memory
+selected report interval, set `report_start_s` and `report_end_s` before the
+run. A second accumulator exports that interval under `report_window` in
+the summary. Arbitrary retrospective windows and per-request plots require
+raw data and are available only when raw recording is enabled.
+
 Enable the normal Mooncake benchmark targets:
 
 ```bash
@@ -97,16 +119,14 @@ Buffer lifecycle. Use `put_from`/`upsert_from` for the zero-copy writer path.
 - `POST /summary`: write `summary.json` immediately.
 - `POST /stop` (alias `/shutdown`): graceful shutdown.
 
-The output directory contains `latency_samples.csv` and `summary.json`;
-`metrics_<id>.csv` is optional (`metrics_interval_ms=0` by default). `latency_samples.csv`
-has one row per measured operation; samples are retained in memory during the run
-and written in one batch during shutdown, so request-path file I/O does not
-contaminate latency. Interface latency surrounds only the corresponding Mooncake
+The output directory contains `summary.json` with exported digest centroids;
+`metrics_<id>.csv` is optional (`metrics_interval_ms=0` by default).
+Interface latency surrounds only the corresponding Mooncake
 SDK call. Data verification is performed after the timed call.
 `notify_queue_wait` is reported separately. Summary JSON includes
 `elapsed_seconds` measured from the last metric reset, per-operation
 `busy_ms`/`throughput_mb_s` (successful bytes / successful latency), and
-nearest-rank percentiles over successful requests. The legacy
+t-digest percentiles over successful requests. The legacy
 window-aggregated `latency_timeseries.csv` is no longer produced.
 
 ## Configuration

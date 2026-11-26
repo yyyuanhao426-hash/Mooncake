@@ -85,7 +85,7 @@ TEST(MetricsWindowTest, ResetStartsAFreshWindow) {
 
 
 
-TEST(MetricsSamplesTest, DecimationCapsRetainedSamples) {
+TEST(MetricsSamplesTest, DigestReplacesWholeRunSamples) {
     const std::string dir = MetricsDir("decimation");
     std::filesystem::remove_all(dir);
     MetricsCollector metrics(9, 60000, dir, 10);
@@ -99,12 +99,16 @@ TEST(MetricsSamplesTest, DecimationCapsRetainedSamples) {
     EXPECT_EQ(snaps[0].total, 200u);
     EXPECT_EQ(snaps[0].success, 200u);
 
-    std::ifstream input(dir + "/latency_samples.csv");
-    std::string line;
-    int lines = 0;
-    while (std::getline(input, line)) ++lines;
-    EXPECT_LE(lines - 1, 10);  // header + at most samples_max rows
-    EXPECT_GT(lines - 1, 0);
+    EXPECT_FALSE(std::filesystem::exists(dir + "/latency_samples.csv"));
+    std::ifstream input(dir + "/summary.json");
+    Json::Value doc;
+    input >> doc;
+    const auto &op = doc["operations"]["op"];
+    double weight = 0;
+    for (const auto &c : op["digest"]["centroids"]) weight += c[1].asDouble();
+    EXPECT_DOUBLE_EQ(weight, 200);
+    EXPECT_EQ(op[">2000us"].asUInt64(), 198u);
+    EXPECT_DOUBLE_EQ(op["avg_ms"].asDouble(), 100.5);
 }
 
 TEST(MetricsSummaryTest, BusyThroughputUsesAllSuccessLatencies) {
@@ -127,7 +131,7 @@ TEST(MetricsSummaryTest, BusyThroughputUsesAllSuccessLatencies) {
 
     const Json::Value &op = root["operations"]["op"];
     ASSERT_FALSE(op.isNull());
-    // samples_max=2 only limits retained latency samples; busy_ms must cover
+    // Legacy samples_max does not limit statistics; busy_ms must cover
     // every successful request (1+2+...+10 = 55ms).
     EXPECT_DOUBLE_EQ(op["busy_ms"].asDouble(), 55.0);
     EXPECT_EQ(op["success"].asUInt64(), 10u);
@@ -178,7 +182,7 @@ TEST(MetricsMeasurementTest, ResetPausedStopsRecordingUntilArmed) {
     metrics.Stop();
 }
 
-TEST(MetricsSummaryTest, PercentileUsesNearestRankRule) {
+TEST(MetricsSummaryTest, PercentileUsesDigestInterpolation) {
     const std::string dir = MetricsDir("nearest_rank");
     std::filesystem::remove_all(dir);
     MetricsCollector metrics(14, 0, dir);
@@ -196,9 +200,73 @@ TEST(MetricsSummaryTest, PercentileUsesNearestRankRule) {
     ASSERT_TRUE(Json::parseFromStream(builder, input, &root, &errors))
         << errors;
     const Json::Value &op = root["operations"]["op"];
-    // round(0.9 * (10-1)) = 8 -> sorted value 9; linear interpolation would
-    // have produced 9.1.
-    EXPECT_DOUBLE_EQ(op["p90_ms"].asDouble(), 9.0);
+    EXPECT_DOUBLE_EQ(op["p90_ms"].asDouble(), 9.5);
+    EXPECT_DOUBLE_EQ(op["p50_ms"].asDouble(), 5.5);
+    EXPECT_DOUBLE_EQ(op["p95_ms"].asDouble(), 10.0);
+    EXPECT_EQ(op[">5000us"].asUInt64(), 5u);
     EXPECT_DOUBLE_EQ(op["max_ms"].asDouble(), 10.0);
+}
+TEST(TDigestTest, LongRunCentroidsRemainBounded) {
+    TDigest digest;
+    for (int i = 0; i < 1000000; ++i) digest.Add(i);
+    EXPECT_LT(digest.Centroids().size(), 2000u);
+    double weight = 0;
+    for (const auto &c : digest.Centroids()) weight += c.weight;
+    EXPECT_DOUBLE_EQ(weight, 1000000);
+    EXPECT_NEAR(digest.Quantile(.9999), 999900, 100);
+}
+
+TEST(MetricsSummaryTest, ReportWindowExcludesUnselectedRequestsAndFailures) {
+    const auto dir = MetricsDir("report_digest");
+    std::filesystem::remove_all(dir);
+    MetricsCollector metrics(15, 0, dir);
+    metrics.SetReportWindow(0, 10);
+    metrics.Start();
+    metrics.Record("op", 7, RecordStatus::kOk, 100);
+    metrics.Record("op", 99, RecordStatus::kError, 0);
+    metrics.Record("op", 500, RecordStatus::kOk, 100, 0, true);
+    metrics.Stop();
+    std::ifstream input(dir + "/summary.json");
+    Json::Value doc;
+    input >> doc;
+    const auto &op = doc["report_window"]["operations"]["op"];
+    EXPECT_EQ(op["total"].asUInt64(), 2u);
+    EXPECT_EQ(op["success"].asUInt64(), 1u);
+    EXPECT_DOUBLE_EQ(op["avg_ms"].asDouble(), 7);
+    EXPECT_EQ(op[">6000us"].asUInt64(), 1u);
+    EXPECT_EQ(op[">7000us"].asUInt64(), 0u);
+}
+TEST(MetricsRawTest, OptionalSamplesKeepDigestAndExcludeWarmupAfterReset) {
+    const auto dir = MetricsDir("raw_enabled");
+    std::filesystem::remove_all(dir);
+    MetricsCollector metrics(16, 0, dir, 0, true);
+    metrics.Start();
+    metrics.Record("op", 500, RecordStatus::kOk, 1);
+    metrics.Reset();
+    metrics.Record("op", 1, RecordStatus::kOk, 10);
+    metrics.Record("op", 3, RecordStatus::kOk, 10);
+    metrics.Record("op", 99, RecordStatus::kError, 0, -2);
+    metrics.Record("op", 500, RecordStatus::kOk, 1, 0, true);
+    metrics.Stop();
+    std::ifstream raw(dir + "/latency_samples.csv");
+    ASSERT_TRUE(raw.good());
+    std::string line;
+    int lines = 0;
+    while (std::getline(raw, line)) {
+        if (lines > 0) {
+            std::istringstream row(line);
+            std::string field;
+            for (int column = 0; column <= 4; ++column) std::getline(row, field, ',');
+            EXPECT_LT(std::stod(field), 100);
+        }
+        ++lines;
+    }
+    EXPECT_EQ(lines, 4);
+    std::ifstream summary(dir + "/summary.json");
+    Json::Value doc;
+    summary >> doc;
+    EXPECT_TRUE(doc["record_raw_samples"].asBool());
+    EXPECT_DOUBLE_EQ(doc["operations"]["op"]["avg_ms"].asDouble(), 2);
+    EXPECT_TRUE(doc["operations"]["op"].isMember("digest"));
 }
 }  // namespace mooncake::kvtest

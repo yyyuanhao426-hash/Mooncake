@@ -20,6 +20,7 @@
   "key_pool_size": 256,
   "data_sizes": ["8MB"],
   "metrics_interval_ms": 0,
+  "record_raw_samples": false,
   "output_dir": "kvtest-writer-output",
   "nodes": [
     {

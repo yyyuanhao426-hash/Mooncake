@@ -97,6 +97,9 @@ struct Config {
 
     // Metrics.
     uint64_t samples_max{0};
+    bool record_raw_samples{false};
+    double report_start_s{0};
+    double report_end_s{0};
     size_t notify_queue_max{65536};
     bool start_paused{false};
     std::vector<uint64_t> data_sizes{1024 * 1024};

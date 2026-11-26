@@ -212,7 +212,10 @@ int main(int argc, char **argv) {
 #endif
 
     MetricsCollector metrics(config.instance_id, config.metrics_interval_ms,
-                             config.output_dir, config.samples_max);
+                             config.output_dir, config.samples_max,
+                             config.record_raw_samples);
+    if (config.report_end_s > 0)
+        metrics.SetReportWindow(config.report_start_s, config.report_end_s);
     metrics.Start();
 
     std::unique_ptr<PipelineWriter> writer;
