@@ -31,8 +31,10 @@
 #include "error.h"
 #include "mooncake_logging.h"
 #include "transfer_metadata_plugin.h"
+#include "spdiag_program_name.h"
+
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#define SPDIAG_PROGRAM_NAME mooncake::SpDiagProgramName("mooncake_store")
 #include "spdiag/auto_perf.h"
 
 namespace mooncake {

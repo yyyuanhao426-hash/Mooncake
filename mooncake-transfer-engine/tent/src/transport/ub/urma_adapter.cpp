@@ -1,3 +1,4 @@
+#include "transfer_spdiag.h"
 // Copyright 2026 KVCache.AI
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -1835,6 +1836,8 @@ class RealUrmaAdapter final : public UrmaAdapter {
 
     Status poll(const JfcPtr& jfc, size_t max_completions,
                 std::vector<Completion>& completions) override {
+        mooncake::transfer_diag::Scope perf_scope_SD_TENT_POLL(
+            PerfKey::SD_TENT_POLL);
         completions.clear();
         std::shared_ptr<RuntimeLease> runtime;
         CHECK_STATUS(getRuntime(runtime));

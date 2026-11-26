@@ -1,3 +1,4 @@
+#include "transfer_spdiag.h"
 #pragma once
 
 #include <algorithm>
@@ -40,8 +41,9 @@ class ScopedReadTransferTrace {
     ScopedReadTransferTrace(uint64_t bytes, Clock::time_point start)
         : previous_(current_),
           start_(start),
-          enabled_(SampleStoreTransferTrace() &&
-                   bytes >= StoreTransferTraceMinBytes()) {
+          enabled_(transfer_diag::enabled() ||
+                   (SampleStoreTransferTrace() &&
+                    bytes >= StoreTransferTraceMinBytes())) {
         current_ = enabled_ ? this : nullptr;
     }
     ~ScopedReadTransferTrace() { current_ = previous_; }
@@ -52,6 +54,23 @@ class ScopedReadTransferTrace {
         ++current_->transfers_;
         current_->submit_ = start;
         current_->done_ = done;
+    }
+    void recordRead(Clock::time_point end) const {
+        if (!valid(end)) return;
+        transfer_diag::record(
+            PerfKey::SD_READ_BEFORE,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(submit_ -
+                                                                 start_)
+                .count());
+        transfer_diag::record(
+            PerfKey::SD_READ_TRANSFER,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(done_ -
+                                                                 submit_)
+                .count());
+        transfer_diag::record(
+            PerfKey::SD_READ_AFTER,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - done_)
+                .count());
     }
     bool valid(Clock::time_point end) const {
         return enabled_ && transfers_ == 1 && start_ <= submit_ &&
@@ -79,13 +98,70 @@ class ScopedReadTransferTrace {
     size_t transfers_ = 0;
 };
 
+inline void RecordPathStage(const char* scope, const char* phase, uint64_t ns) {
+    if (!std::strcmp(scope, "get_buffer_read") &&
+        !std::strcmp(phase, "slices_and_replica"))
+        transfer_diag::record(
+            PerfKey::SD_PATH_GET_BUFFER_READ_SLICES_AND_REPLICA, ns);
+    if (!std::strcmp(scope, "get_buffer_read") &&
+        !std::strcmp(phase, "client_get"))
+        transfer_diag::record(PerfKey::SD_PATH_GET_BUFFER_READ_CLIENT_GET, ns);
+    if (!std::strcmp(scope, "get_buffer_read") &&
+        !std::strcmp(phase, "get_breakdown_log"))
+        transfer_diag::record(
+            PerfKey::SD_PATH_GET_BUFFER_READ_GET_BREAKDOWN_LOG, ns);
+    if (!std::strcmp(scope, "get_buffer_read") && !std::strcmp(phase, "tail"))
+        transfer_diag::record(PerfKey::SD_PATH_GET_BUFFER_READ_TAIL, ns);
+    if (!std::strcmp(scope, "get_buffer_read") && !std::strcmp(phase, "total"))
+        transfer_diag::record(PerfKey::SD_PATH_GET_BUFFER_READ_TOTAL, ns);
+    if (!std::strcmp(scope, "client_get") &&
+        !std::strcmp(phase, "select_replica"))
+        transfer_diag::record(PerfKey::SD_PATH_CLIENT_GET_SELECT_REPLICA, ns);
+    if (!std::strcmp(scope, "client_get") &&
+        !std::strcmp(phase, "cache_and_validate"))
+        transfer_diag::record(PerfKey::SD_PATH_CLIENT_GET_CACHE_AND_VALIDATE,
+                              ns);
+    if (!std::strcmp(scope, "client_get") &&
+        !std::strcmp(phase, "transfer_read"))
+        transfer_diag::record(PerfKey::SD_PATH_CLIENT_GET_TRANSFER_READ, ns);
+    if (!std::strcmp(scope, "client_get") &&
+        !std::strcmp(phase, "release_cache_and_metrics"))
+        transfer_diag::record(
+            PerfKey::SD_PATH_CLIENT_GET_RELEASE_CACHE_AND_METRICS, ns);
+    if (!std::strcmp(scope, "client_get") && !std::strcmp(phase, "checksum"))
+        transfer_diag::record(PerfKey::SD_PATH_CLIENT_GET_CHECKSUM, ns);
+    if (!std::strcmp(scope, "client_get") && !std::strcmp(phase, "tail"))
+        transfer_diag::record(PerfKey::SD_PATH_CLIENT_GET_TAIL, ns);
+    if (!std::strcmp(scope, "client_get") && !std::strcmp(phase, "total"))
+        transfer_diag::record(PerfKey::SD_PATH_CLIENT_GET_TOTAL, ns);
+    if (!std::strcmp(scope, "client_transfer_data") &&
+        !std::strcmp(phase, "plan_and_submit"))
+        transfer_diag::record(
+            PerfKey::SD_PATH_CLIENT_TRANSFER_DATA_PLAN_AND_SUBMIT, ns);
+    if (!std::strcmp(scope, "client_transfer_data") &&
+        !std::strcmp(phase, "future_get"))
+        transfer_diag::record(PerfKey::SD_PATH_CLIENT_TRANSFER_DATA_FUTURE_GET,
+                              ns);
+    if (!std::strcmp(scope, "client_transfer_data") &&
+        !std::strcmp(phase, "diagnostics_and_finish"))
+        transfer_diag::record(
+            PerfKey::SD_PATH_CLIENT_TRANSFER_DATA_DIAGNOSTICS_AND_FINISH, ns);
+    if (!std::strcmp(scope, "client_transfer_data") &&
+        !std::strcmp(phase, "tail"))
+        transfer_diag::record(PerfKey::SD_PATH_CLIENT_TRANSFER_DATA_TAIL, ns);
+    if (!std::strcmp(scope, "client_transfer_data") &&
+        !std::strcmp(phase, "total"))
+        transfer_diag::record(PerfKey::SD_PATH_CLIENT_TRANSFER_DATA_TOTAL, ns);
+}
+
 class ScopedTransferPathTrace {
    public:
     ScopedTransferPathTrace(const char* scope, uint64_t bytes)
         : scope_(scope),
           bytes_(bytes),
-          enabled_(SampleStoreTransferTrace() &&
-                   bytes >= StoreTransferTraceMinBytes()) {
+          enabled_(transfer_diag::enabled() ||
+                   (SampleStoreTransferTrace() &&
+                    bytes >= StoreTransferTraceMinBytes())) {
         if (enabled_) {
             trace_id_ = logging::CurrentTraceId();
             start_ = last_ = Clock::now();
@@ -94,12 +170,25 @@ class ScopedTransferPathTrace {
     void mark(const char* phase) {
         if (!enabled_ || count_ == phases_.size()) return;
         auto now = Clock::now();
+        RecordPathStage(
+            scope_, phase,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_)
+                .count());
         phases_[count_++] = {phase, now - last_};
         last_ = now;
     }
     ~ScopedTransferPathTrace() {
         if (!enabled_) return;
         const auto end = Clock::now();
+        RecordPathStage(
+            scope_, "tail",
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - last_)
+                .count());
+        RecordPathStage(
+            scope_, "total",
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start_)
+                .count());
+        if (!SampleStoreTransferTrace()) return;
         std::ostringstream fields;
         for (size_t i = 0; i < count_; ++i) {
             fields << ' ' << phases_[i].name << "_us="

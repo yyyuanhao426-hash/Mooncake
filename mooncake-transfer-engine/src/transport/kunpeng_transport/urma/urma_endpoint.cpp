@@ -30,8 +30,10 @@
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
 #include "transport/kunpeng_transport/urma/bonding_policy.h"
 #include "transport/kunpeng_transport/urma/urma_eid.h"
+#include "spdiag_program_name.h"
+
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#define SPDIAG_PROGRAM_NAME mooncake::SpDiagProgramName("mooncake_store")
 #include "spdiag/auto_perf.h"
 #include "transport/kunpeng_transport/ub_diagnostics.h"
 

@@ -32,8 +32,10 @@
 // must match the other TUs (store_py/real_client/client_service); each TU's
 // static initializer writes the shared detail::AutoProgramName(), and leaving
 // it nullptr here could clobber the program name depending on init order.
+#include "spdiag_program_name.h"
+
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#define SPDIAG_PROGRAM_NAME mooncake::SpDiagProgramName("mooncake_store")
 #include "spdiag/auto_perf.h"
 
 namespace mooncake {

@@ -1,3 +1,4 @@
+#include "transfer_spdiag.h"
 #include "transfer_task.h"
 
 #include <glog/logging.h>
@@ -90,11 +91,12 @@ static uint64_t TransferTraceMinBytes() {
         }
         return static_cast<uint64_t>(parsed);
     }();
+    if (mooncake::transfer_diag::enabled()) return value > 0 ? value : 1;
     return mooncake::logging::ShouldSampleHiFreqLog(
                mooncake::logging::CurrentTraceId()) &&
                    mooncake::logging::ShouldLog(google::INFO)
                ? value
-               : 0;
+               : (mooncake::transfer_diag::enabled() ? 1 : 0);
 }
 
 static int64_t ElapsedUs(std::chrono::steady_clock::time_point begin,
@@ -1540,6 +1542,24 @@ void MemcpyWorkerPool::workerThread() {
 // ============================================================================
 
 TransferEngineOperationState::~TransferEngineOperationState() {
+    mooncake::transfer_diag::Scope perf_scope_SD_BATCH_RELEASE(
+        PerfKey::SD_BATCH_RELEASE);
+    struct BoundaryRestore {
+        mooncake::transfer_diag::Boundaries saved =
+            mooncake::transfer_diag::last_transfer;
+        ~BoundaryRestore() { mooncake::transfer_diag::last_transfer = saved; }
+    } restore;
+    if (trace_)
+        mooncake::transfer_diag::last_transfer = {
+            batch_id_,
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    trace_->submit_start.time_since_epoch())
+                    .count()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    trace_->observed_done.time_since_epoch())
+                    .count())};
     const auto free_start = trace_ ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point{};
 #ifdef USE_TENT
@@ -1550,20 +1570,26 @@ TransferEngineOperationState::~TransferEngineOperationState() {
         engine_.freeBatchID(batch_id_);
     if (trace_) {
         const auto free_end = std::chrono::steady_clock::now();
-        MC_LOG(INFO)
-            << "transfer_release_trace trace_id=" << trace_->trace_id
-            << " batch=0x" << std::hex << batch_id_ << std::dec
-            << " engine=" << (trace_->is_tent ? "tent" : "classic")
-            << " free_batch_us=" << ElapsedUs(free_start, free_end)
-            << " completion_trace_log_us="
-            << (trace_->observed_done == std::chrono::steady_clock::time_point{}
-                    ? -1
-                    : ElapsedUs(trace_->observed_done, trace_->trace_log_end))
-            << " observed_to_release_us="
-            << (trace_->observed_done == std::chrono::steady_clock::time_point{}
-                    ? -1
-                    : ElapsedUs(trace_->observed_done, free_start))
-            << " status_observed=" << result_.has_value();
+        mooncake::transfer_diag::record(PerfKey::SD_TRANSFER_FREE,
+                                        ElapsedUs(free_start, free_end) * 1000);
+        if (mooncake::logging::ShouldSampleHiFreqLog(trace_->trace_id))
+            MC_LOG(INFO) << "transfer_release_trace trace_id="
+                         << trace_->trace_id << " batch=0x" << std::hex
+                         << batch_id_ << std::dec
+                         << " engine=" << (trace_->is_tent ? "tent" : "classic")
+                         << " free_batch_us=" << ElapsedUs(free_start, free_end)
+                         << " completion_trace_log_us="
+                         << (trace_->observed_done ==
+                                     std::chrono::steady_clock::time_point{}
+                                 ? -1
+                                 : ElapsedUs(trace_->observed_done,
+                                             trace_->trace_log_end))
+                         << " observed_to_release_us="
+                         << (trace_->observed_done ==
+                                     std::chrono::steady_clock::time_point{}
+                                 ? -1
+                                 : ElapsedUs(trace_->observed_done, free_start))
+                         << " status_observed=" << result_.has_value();
     }
 }
 
@@ -1585,6 +1611,13 @@ void TransferEngineOperationState::log_wait_return() {
     ScopedReadTransferTrace::record(trace_->submit_start,
                                     trace_->observed_done);
     const auto now = std::chrono::steady_clock::now();
+    mooncake::transfer_diag::record(
+        PerfKey::SD_TRANSFER_RETURN,
+        ElapsedUs(trace_->observed_done, now) * 1000);
+    mooncake::transfer_diag::record(
+        PerfKey::SD_TRANSFER_LOG,
+        ElapsedUs(trace_->observed_done, trace_->trace_log_end) * 1000);
+    if (!mooncake::logging::ShouldSampleHiFreqLog(trace_->trace_id)) return;
     MC_LOG(INFO) << "transfer_wait_return_trace trace_id=" << trace_->trace_id
                  << " batch=0x" << std::hex << batch_id_ << std::dec
                  << " engine=" << (trace_->is_tent ? "tent" : "classic")
@@ -1713,6 +1746,16 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
 
 void TransferEngineOperationState::log_trace(ErrorCode error_code) const {
     const auto done = trace_->observed_done;
+    mooncake::transfer_diag::last_transfer = {
+        batch_id_,
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                trace_->submit_start.time_since_epoch())
+                .count()),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                done.time_since_epoch())
+                .count())};
     const auto wait_start =
         trace_->wait_start == std::chrono::steady_clock::time_point{}
             ? trace_->submit_end
@@ -1726,6 +1769,25 @@ void TransferEngineOperationState::log_trace(ErrorCode error_code) const {
     const double mbps = total_us > 0 ? static_cast<double>(trace_->bytes) /
                                            static_cast<double>(total_us)
                                      : 0.0;
+    mooncake::transfer_diag::record(PerfKey::SD_TE_OPEN_SEGMENT_US,
+                                    trace_->open_segment_us * 1000);
+    mooncake::transfer_diag::record(PerfKey::SD_TE_PREPARE_REQUESTS_US,
+                                    trace_->prepare_requests_us * 1000);
+    mooncake::transfer_diag::record(PerfKey::SD_TE_ALLOC_BATCH_US,
+                                    trace_->alloc_batch_us * 1000);
+    mooncake::transfer_diag::record(PerfKey::SD_TE_BUILD_REQUESTS_US,
+                                    trace_->build_requests_us * 1000);
+    mooncake::transfer_diag::record(PerfKey::SD_TE_ENGINE_SUBMIT_US,
+                                    trace_->engine_submit_us * 1000);
+    mooncake::transfer_diag::record(PerfKey::SD_TE_STATE_CREATE_US,
+                                    trace_->state_create_us * 1000);
+    mooncake::transfer_diag::record(
+        PerfKey::SD_TE_WAIT_DELAY,
+        ElapsedUs(trace_->submit_end, wait_start) * 1000);
+    mooncake::transfer_diag::record(PerfKey::SD_TE_WAIT, wait_us * 1000);
+    mooncake::transfer_diag::record(
+        PerfKey::SD_TE_TOTAL, ElapsedUs(trace_->submit_start, done) * 1000);
+    if (!mooncake::logging::ShouldSampleHiFreqLog(trace_->trace_id)) return;
     MC_LOG(INFO) << "transfer_trace trace_id=" << trace_->trace_id
                  << " batch=0x" << std::hex << batch_id_ << std::dec
                  << " op=" << (trace_->is_read ? "read" : "write")
@@ -1762,6 +1824,8 @@ void TransferEngineOperationState::log_trace(ErrorCode error_code) const {
 }
 
 void TransferEngineOperationState::wait_for_completion() {
+    mooncake::transfer_diag::Scope perf_scope_SD_TRANSFER_WAIT(
+        PerfKey::SD_TRANSFER_WAIT);
     if (trace_) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (trace_->wait_start == std::chrono::steady_clock::time_point{}) {
@@ -2799,6 +2863,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     std::vector<TransferRequest>& requests, TransferIntent intent,
     int64_t open_segment_us, int64_t prepare_requests_us,
     std::chrono::steady_clock::time_point path_start) {
+    mooncake::transfer_diag::Scope perf_scope_SD_TRANSFER_SUBMIT(
+        PerfKey::SD_TRANSFER_SUBMIT);
     const auto submit_start = TransferTraceMinBytes() > 0
                                   ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};

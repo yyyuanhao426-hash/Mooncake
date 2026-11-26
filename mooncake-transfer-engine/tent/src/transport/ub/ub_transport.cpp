@@ -1,3 +1,4 @@
+#include "transfer_spdiag.h"
 // Copyright 2026 KVCache.AI
 // SPDX-License-Identifier: Apache-2.0
 
@@ -708,6 +709,8 @@ Status UbTransport::freeSubBatch(SubBatchRef& batch) {
         ub_batch->trace_reporter->submit(ub_batch->task_list,
                                          ub_batch->progress_batch_id);
     }
+    for (const auto& task : ub_batch->task_list)
+        ub::recordUbTaskSpdiag(*task, ub_batch->progress_batch_id);
     ub_batch->task_list.clear();
     delete ub_batch;
     batch = nullptr;
@@ -716,11 +719,20 @@ Status UbTransport::freeSubBatch(SubBatchRef& batch) {
 
 Status UbTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request>& request_list) {
+    mooncake::transfer_diag::Scope perf_scope_SD_TENT_SUBMIT(
+        PerfKey::SD_TENT_SUBMIT);
     auto* ub_batch = dynamic_cast<UbSubBatch*>(batch);
     if (!ub_batch) {
         return Status::InvalidArgument("Invalid UB sub-batch" LOC_MARK);
     }
+    SpDiag::PerfPoint lock_wait(PerfKey::SD_TENT_LIFECYCLE_WAIT,
+                                SpDiag::PerfLevel::MODULE);
+    lock_wait.Start();
     std::shared_lock<std::shared_mutex> lock(impl_->lifecycle_mutex);
+    lock_wait.End();
+    SpDiag::PerfPoint prepare_stage(PerfKey::SD_TENT_SUBMIT_PREPARE,
+                                    SpDiag::PerfLevel::MODULE);
+    prepare_stage.Start();
     if (!impl_->installed.load(std::memory_order_acquire) || !impl_->workers) {
         return Status::InvalidArgument(
             "UB transport is not installed" LOC_MARK);
@@ -767,6 +779,7 @@ Status UbTransport::submitTransferTasks(
             mooncake::logging::ShouldSampleHiFreqLog(log_trace_id) &&
             mooncake::logging::ShouldLog(google::INFO);
         task->setLogContext(log_trace_id, sampled);
+        if (mooncake::transfer_diag::enabled()) task->enableTrace();
         if (sampled && impl_->trace_reporter &&
             request.length >= ub::ubTaskTraceMinBytes()) {
             task->enableTrace();
@@ -791,6 +804,8 @@ Status UbTransport::submitTransferTasks(
         new_tasks.push_back(std::move(task));
     }
 
+    prepare_stage.End();
+    mooncake::transfer_diag::Scope commit_stage(PerfKey::SD_TENT_SUBMIT_COMMIT);
     CHECK_STATUS(impl_->workers->submitBatch(new_tasks, ub_batch->device_mask));
     ub_batch->task_list.insert(ub_batch->task_list.end(), new_tasks.begin(),
                                new_tasks.end());

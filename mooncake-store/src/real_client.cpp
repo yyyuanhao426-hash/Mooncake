@@ -1,3 +1,4 @@
+#include "transfer_spdiag.h"
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -4424,6 +4425,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const std::string &key,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
     bool heal_dangling_disk_replica) {
+    mooncake::transfer_diag::Scope perf_scope_SD_GET_BUFFER(
+        PerfKey::SD_GET_BUFFER);
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return nullptr;
@@ -4436,7 +4439,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
     // both the breakdown timing capture and its emission below.
     const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
-        mooncake::logging::CurrentTraceId());
+                                   mooncake::logging::CurrentTraceId()) ||
+                               mooncake::transfer_diag::enabled();
     auto t0 = breakdown_log ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
     auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
@@ -4510,6 +4514,25 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     auto log_breakdown = [&](const char *status) {
         if (!breakdown_log) return;
         auto now = std::chrono::steady_clock::now();
+        ab_trace.recordRead(now);
+        mooncake::transfer_diag::record(
+            PerfKey::SD_READ_QUERY,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t_query - t0)
+                .count());
+        mooncake::transfer_diag::record(
+            PerfKey::SD_READ_SELECT,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t_select -
+                                                                 t_query)
+                .count());
+        mooncake::transfer_diag::record(
+            PerfKey::SD_READ_ALLOC,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t_alloc -
+                                                                 t_select)
+                .count());
+
+        if (!mooncake::logging::ShouldSampleHiFreqLog(
+                mooncake::logging::CurrentTraceId()))
+            return;
         auto query_us =
             std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0)
                 .count();
@@ -6815,6 +6838,8 @@ tl::expected<void, ErrorCode> RealClient::upsert_dummy_helper(
 tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
     const std::string &key, void *buffer, size_t size,
     const ReplicateConfig &config) {
+    mooncake::transfer_diag::Scope perf_scope_SD_UPSERT_FROM(
+        PerfKey::SD_UPSERT_FROM);
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);

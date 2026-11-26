@@ -1,3 +1,4 @@
+#include "transfer_spdiag.h"
 #include "client_service.h"
 
 #include <boost/algorithm/string.hpp>
@@ -66,8 +67,10 @@
 #include "config/client_numa_config.h"
 #include "storage/distributed/distributed_storage_backend.h"
 
+#include "spdiag_program_name.h"
+
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#define SPDIAG_PROGRAM_NAME mooncake::SpDiagProgramName("mooncake_store")
 #include "spdiag/auto_perf.h"
 
 namespace mooncake {
@@ -3770,8 +3773,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         const ReplicateConfig& config, bool enable_upsert_from_diagnostics) {
         const uint64_t trace_id = mooncake::logging::CurrentTraceId();
         const bool breakdown_log =
-            enable_upsert_from_diagnostics &&
-            mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+            (enable_upsert_from_diagnostics &&
+             mooncake::logging::ShouldSampleHiFreqLog(trace_id)) ||
+            mooncake::transfer_diag::enabled();
         const auto breakdown_start =
             breakdown_log ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point{};
@@ -3814,8 +3818,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         SpDiag::PerfPoint pt_query(PerfKey::UPSERT_FROM_INTERNAL_QUERY,
                                    SpDiag::PerfLevel::MODULE);
         if (enable_upsert_from_diagnostics) pt_query.Start();
-        auto start_result =
-            master_client_.UpsertStart(key, slice_lengths, client_cfg);
+        auto start_result = [&]() {
+            mooncake::transfer_diag::Scope stage(PerfKey::SD_UPSERT_START);
+            return master_client_.UpsertStart(key, slice_lengths, client_cfg);
+        }();
         if (enable_upsert_from_diagnostics) {
             pt_query.End(start_result ? 0 : -1);
         }
@@ -3953,20 +3959,53 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                            end - begin)
                     .count();
             };
-            MC_LOG(INFO)
-                << "upsert_from_breakdown trace_id=" << trace_id
-                << " key=" << key << " slices=" << slices.size()
-                << " replicas=" << upsert_start.replicas.size()
-                << " checksum_us=" << elapsed_us(breakdown_start, checksum_end)
-                << " prepare_us=" << elapsed_us(checksum_end, prepare_end)
-                << " query_us=" << elapsed_us(prepare_end, query_end)
-                << " transfer_us=" << elapsed_us(query_end, transfer_end)
-                << " finalize_us=" << elapsed_us(transfer_end, finalize_end)
-                << " cache_invalidate_us="
-                << elapsed_us(finalize_end, cache_invalidate_end)
-                << " total_us="
-                << elapsed_us(breakdown_start, cache_invalidate_end)
-                << " status=ok";
+            mooncake::transfer_diag::record(
+                PerfKey::SD_UPSERT_CHECKSUM,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    checksum_end - breakdown_start)
+                    .count());
+            mooncake::transfer_diag::record(
+                PerfKey::SD_UPSERT_PREPARE,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    prepare_end - checksum_end)
+                    .count());
+
+            mooncake::transfer_diag::record(
+                PerfKey::SD_UPSERT_TRANSFER,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    transfer_end - query_end)
+                    .count());
+            mooncake::transfer_diag::record(
+                PerfKey::SD_UPSERT_FINALIZE,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    finalize_end - transfer_end)
+                    .count());
+            mooncake::transfer_diag::record(
+                PerfKey::SD_UPSERT_INVALIDATE,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    cache_invalidate_end - finalize_end)
+                    .count());
+            mooncake::transfer_diag::record(
+                PerfKey::SD_UPSERT_TOTAL,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    cache_invalidate_end - breakdown_start)
+                    .count());
+            if (mooncake::logging::ShouldSampleHiFreqLog(trace_id))
+                MC_LOG(INFO)
+                    << "upsert_from_breakdown trace_id=" << trace_id
+                    << " key=" << key << " slices=" << slices.size()
+                    << " replicas=" << upsert_start.replicas.size()
+                    << " checksum_us="
+                    << elapsed_us(breakdown_start, checksum_end)
+                    << " prepare_us=" << elapsed_us(checksum_end, prepare_end)
+                    << " query_us=" << elapsed_us(prepare_end, query_end)
+                    << " transfer_us=" << elapsed_us(query_end, transfer_end)
+                    << " finalize_us=" << elapsed_us(transfer_end, finalize_end)
+                    << " cache_invalidate_us="
+                    << elapsed_us(finalize_end, cache_invalidate_end)
+                    << " total_us="
+                    << elapsed_us(breakdown_start, cache_invalidate_end)
+                    << " status=ok";
         }
 
         return {};
@@ -7575,11 +7614,18 @@ ErrorCode Client::TransferData(
             client_slices.push_back(
                 {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
         }
-        auto plan = vsegment_transfer_planner_->Plan(
-            replica_descriptor.get_vsegment_descriptor(), client_slices, layouts);
+        auto plan = [&]() {
+            mooncake::transfer_diag::Scope stage(PerfKey::SD_VSEG_PLAN);
+            return vsegment_transfer_planner_->Plan(
+                replica_descriptor.get_vsegment_descriptor(), client_slices,
+                layouts);
+        }();
         if (!plan) return plan.error;
         for (const auto& request : plan.requests) endpoints.push_back(request.endpoint);
-        future = transfer_submitter_->submitVSegment(plan, op_code);
+        future = [&]() {
+            mooncake::transfer_diag::Scope stage(PerfKey::SD_VSEG_SUBMIT);
+            return transfer_submitter_->submitVSegment(plan, op_code);
+        }();
     } else {
         auto submitted = SubmitSingleTransfer(replica_descriptor, slices, op_code, intent);
         if (!submitted) return submitted.error();

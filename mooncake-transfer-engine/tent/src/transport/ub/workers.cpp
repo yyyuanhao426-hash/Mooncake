@@ -1,3 +1,4 @@
+#include "transfer_spdiag.h"
 // Copyright 2026 KVCache.AI
 // SPDX-License-Identifier: Apache-2.0
 
@@ -713,6 +714,8 @@ void UbWorkers::deferPending(const PendingSlice& pending) {
 }
 
 Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
+    mooncake::transfer_diag::Scope perf_scope_SD_TENT_ROUTE(
+        PerfKey::SD_TENT_ROUTE);
     // Metadata sub-phase checkpoints for traced tasks: segment descriptor
     // resolved from cache -> buffer found -> metadata decoded -> remote
     // devices ordered.
@@ -908,6 +911,8 @@ Status UbWorkers::chooseAndResolveEndpoint(
     const PendingSlice& pending, Route& route,
     std::shared_ptr<UbEndpoint>& endpoint, UbPostPath& path,
     QuotaReservation& reservation) {
+    mooncake::transfer_diag::Scope perf_scope_SD_TENT_SELECT(
+        PerfKey::SD_TENT_SELECT);
     struct Candidate {
         std::shared_ptr<UbEndpoint> endpoint;
         UbPostPath path;
@@ -1526,6 +1531,8 @@ void UbWorkers::scanTimeouts() {
 }
 
 void UbWorkers::releaseInflight(const std::shared_ptr<Inflight>& inflight) {
+    mooncake::transfer_diag::Scope perf_scope_SD_TENT_RELEASE(
+        PerfKey::SD_TENT_RELEASE);
     bool expected = false;
     if (!inflight || !inflight->resources_released.compare_exchange_strong(
                          expected, true, std::memory_order_acq_rel)) {

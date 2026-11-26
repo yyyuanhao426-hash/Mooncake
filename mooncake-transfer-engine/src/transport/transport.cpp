@@ -1,3 +1,4 @@
+#include "transfer_spdiag.h"
 // Copyright 2024 KVCache.AI
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -61,6 +62,7 @@ void Transport::logClassicUbTaskTrace(const TransferTask &task) {
     }
     auto end = trace.terminal_ns.load(std::memory_order_acquire);
     const bool task_terminal = end != 0;
+    mooncake::transfer_diag::taskEdges(task.batch_id, trace.created_ns, end);
     if (!task_terminal) end = last_complete;
     const bool complete =
         !trace.slices.empty() && terminal == trace.slices.size();
@@ -88,6 +90,20 @@ void Transport::logClassicUbTaskTrace(const TransferTask &task) {
             << rank(99) << '/' << static_cast<double>(samples.back()) / 1000.0;
         return out.str();
     };
+    mooncake::transfer_diag::interval(PerfKey::SD_CLASSIC_TASK,
+                                      trace.created_ns, end);
+    for (const auto &item : trace.slices) {
+        auto done = item->terminal_ns.load();
+        auto returned = item->post_returned_ns.load();
+        auto started = item->post_ns.load();
+        auto seen = item->cqe_seen_ns.load();
+        mooncake::transfer_diag::interval(PerfKey::SD_CLASSIC_DEVICE, returned,
+                                          seen);
+        mooncake::transfer_diag::interval(PerfKey::SD_CLASSIC_CQH, seen, done);
+        mooncake::transfer_diag::interval(PerfKey::SD_CLASSIC_POST, started,
+                                          returned);
+    }
+    if (!mooncake::logging::ShouldSampleHiFreqLog(trace.trace_id)) return;
     MC_LOG(INFO)
         << "ub_task_trace engine=classic trace_id=" << trace.trace_id
         << " batch=0x" << std::hex << task.batch_id << std::dec

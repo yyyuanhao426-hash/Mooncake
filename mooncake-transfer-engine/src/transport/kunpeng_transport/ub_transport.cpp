@@ -1,3 +1,4 @@
+#include "transfer_spdiag.h"
 // Copyright 2024 KVCache.AI
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -662,7 +663,7 @@ Status UbTransport::submitTransferTask(
         trace_min_bytes > 0 &&
         logging::ShouldSampleHiFreqLog(logging::CurrentTraceId()) &&
         logging::ShouldLog(google::INFO);
-    if (sample_trace) {
+    if (sample_trace || mooncake::transfer_diag::enabled()) {
         for (const auto* task : task_list) {
             if (task && task->request) trace_bytes += task->request->length;
         }
@@ -692,7 +693,8 @@ Status UbTransport::submitTransferTask(
         nr_slices = 0;
         assert(task.request);
         auto& request = *task.request;
-        if (sample_trace && request.length >= trace_min_bytes) {
+        if (mooncake::transfer_diag::enabled() ||
+            (sample_trace && request.length >= trace_min_bytes)) {
             task.ub_trace = std::make_shared<UbTaskTrace>();
             task.ub_trace->created_ns = ubTraceNowNs();
             task.ub_trace->trace_id = logging::CurrentTraceId();

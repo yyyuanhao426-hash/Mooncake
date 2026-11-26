@@ -192,6 +192,7 @@ endif()
 include_directories(mooncake-common/etcd)
 include_directories(mooncake-common/k8s-lease)
 include_directories(mooncake-common/include)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-integration/store)
 
 if(WITH_TE)
   add_subdirectory(mooncake-transfer-engine)

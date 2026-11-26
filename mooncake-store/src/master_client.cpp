@@ -1,3 +1,4 @@
+#include "transfer_spdiag.h"
 #include "master_client.h"
 
 #include <async_simple/coro/FutureAwaiter.h>
@@ -35,8 +36,10 @@
 #include "master_metric_manager.h"
 #include "version.h"
 
+#include "spdiag_program_name.h"
+
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#define SPDIAG_PROGRAM_NAME mooncake::SpDiagProgramName("mooncake_store")
 
 #include <optional>
 #include "spdiag/auto_perf.h"
@@ -639,6 +642,8 @@ template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
     const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
     Args&&... args) {
+    mooncake::transfer_diag::Scope point_SD_RPC_POOL_CALL(
+        PerfKey::SD_RPC_POOL_CALL);
     RpcDrainGuard::ScopedCall inflight(rpc_drain_);
     if (!inflight.ok()) {
         return tl::make_unexpected(ErrorCode::RPC_FAIL);
@@ -651,17 +656,25 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
     auto start_time = std::chrono::steady_clock::now();
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
+            SpDiag::PerfPoint pool_send(PerfKey::SD_RPC_ACQUIRE_SEND,
+                                        SpDiag::PerfLevel::MODULE);
+            pool_send.Start();
             auto ret = co_await client_pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
+            pool_send.End(ret.has_value() ? 0 : -1);
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
+            SpDiag::PerfPoint response_wait(PerfKey::SD_RPC_RESPONSE_WAIT,
+                                            SpDiag::PerfLevel::MODULE);
+            response_wait.Start();
             auto result = co_await std::move(ret.value());
+            response_wait.End(result ? 0 : -1);
             if (!result) {
                 if (result.error().code == coro_rpc::errc::timed_out) {
                     LOG(ERROR) << "RPC call timed out: " << result.error().msg;
@@ -678,7 +691,10 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
                 metrics_->rpc_latency.observe(
                     {RpcNameTraits<ServiceMethod>::value}, latency.count());
             }
-            co_return result->result();
+            co_return [&]() {
+                mooncake::transfer_diag::Scope decode(PerfKey::SD_RPC_DECODE);
+                return result->result();
+            }();
         }());
 }
 
@@ -686,7 +702,10 @@ template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_pool(
     RpcClientPool& client_accessor, Args&&... args) {
     return invoke_rpc_with_client_pool<ServiceMethod, ReturnType>(
-        client_accessor.GetClientPool(), std::forward<Args>(args)...);
+        [&]() {
+            mooncake::transfer_diag::Scope lookup(PerfKey::SD_RPC_POOL_LOOKUP);
+            return client_accessor.GetClientPool();
+        }(), std::forward<Args>(args)...);
 }
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
@@ -716,7 +735,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     const auto total_start = breakdown_log
                                  ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
-    auto pool = client_accessor_.GetClientPool();
+    auto pool = [&]() { mooncake::transfer_diag::Scope lookup(PerfKey::SD_RPC_POOL_LOOKUP); return client_accessor_.GetClientPool(); }();
     const auto pool_end = breakdown_log
                               ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
@@ -836,6 +855,7 @@ template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
     RoutedCallTiming* timing, const std::string& tenant_id,
     const std::string& key, uint32_t rpc_stat_key, Args... args) {
+    mooncake::transfer_diag::Scope point_SD_RPC_ROUTED(PerfKey::SD_RPC_ROUTED);
     const auto t_routed_start = timing
                                     ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
@@ -1122,7 +1142,7 @@ WeightRpcResult<void> MasterClient::ReleaseWeightRevisionLease(
 }
 
 void MasterClient::WarmupRpcPool() {
-    auto pool = client_accessor_.GetClientPool();
+    auto pool = [&]() { mooncake::transfer_diag::Scope lookup(PerfKey::SD_RPC_POOL_LOOKUP); return client_accessor_.GetClientPool(); }();
     if (!pool) {
         return;
     }
@@ -1559,6 +1579,7 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
 
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     const std::string& object_key) {
+    mooncake::transfer_diag::Scope perf_scope_SD_RPC_GET(PerfKey::SD_RPC_GET);
     return GetReplicaList(object_key, tenant_id_.value());
 }
 
@@ -2167,6 +2188,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
 tl::expected<PutStartResult, ErrorCode> MasterClient::UpsertStart(
     const std::string& key, const std::vector<size_t>& slice_lengths,
     const ReplicateConfig& config) {
+    mooncake::transfer_diag::Scope perf_scope_SD_RPC_UPSERT_START(
+        PerfKey::SD_RPC_UPSERT_START);
     ScopedVLogTimer timer(1, "MasterClient::UpsertStart");
     timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
 
@@ -2289,6 +2312,8 @@ MasterClient::BatchUpsertStart(
 tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
     const ObjectMeta& object_meta, ReplicaType replica_type,
     const std::string& operation_id) {
+    mooncake::transfer_diag::Scope perf_scope_SD_RPC_UPSERT_END(
+        PerfKey::SD_RPC_UPSERT_END);
     ScopedVLogTimer timer(1, "MasterClient::UpsertEnd");
     timer.LogRequest("key=", object_meta.key);
 
@@ -2395,6 +2420,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertEnd(
 tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
     const std::string& key, ReplicaType replica_type,
     const std::string& operation_id) {
+    mooncake::transfer_diag::Scope perf_scope_SD_RPC_UPSERT_REVOKE(
+        PerfKey::SD_RPC_UPSERT_REVOKE);
     ScopedVLogTimer timer(1, "MasterClient::UpsertRevoke");
     timer.LogRequest("key=", key);
 

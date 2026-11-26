@@ -1,3 +1,4 @@
+#include "transfer_spdiag.h"
 // Copyright 2026 KVCache.AI
 // SPDX-License-Identifier: Apache-2.0
 
@@ -51,7 +52,7 @@ inline bool ubTaskTraceClocksEnabled() {
         ubTaskTraceMinBytes() > 0 &&
         mooncake::logging::HiFreqLogSampleRate() > 0 &&
         mooncake::logging::ShouldLog(google::INFO);
-    return enabled;
+    return enabled || mooncake::transfer_diag::enabled();
 }
 
 // Slice-level latency distribution, in nanoseconds.
@@ -77,6 +78,88 @@ inline UbTraceLatency summarizeUbTraceLatency(std::vector<uint64_t> samples) {
     latency.p99_ns = nearest_rank(99);
     latency.max_ns = samples.back();
     return latency;
+}
+
+inline void recordUbTaskSpdiag(const UbTask& task, uint64_t batch) {
+    if (!task.traceEnabled()) return;
+    const auto snap = task.snapshot();
+    mooncake::transfer_diag::interval(PerfKey::SD_TENT_TASK, snap.created_ns,
+                                      snap.terminal_ns);
+    uint64_t first = 0, last = 0;
+    for (const auto& slice : task.slices()) {
+        const auto s = slice->snapshot();
+        if (s.queued_ns)
+            first = first ? std::min(first, s.queued_ns) : s.queued_ns;
+        last = std::max(last, s.terminal_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_SUBMITBUILD,
+                                          s.created_ns, s.submit_started_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_SUBMITLOCKWAIT,
+                                          s.submit_started_ns,
+                                          s.queue_locked_ns);
+        mooncake::transfer_diag::interval(
+            PerfKey::SD_TENT_ENQUEUE, s.queue_locked_ns, s.enqueue_finished_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_RELEASEENDPOINT,
+                                          s.inflight_erased_ns,
+                                          s.endpoint_released_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_RELEASEQUOTA,
+                                          s.endpoint_released_ns,
+                                          s.quota_released_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_RELEASENOTIFY,
+                                          s.quota_released_ns,
+                                          s.resources_released_ns);
+
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_QUEUE, s.queued_ns,
+                                          s.dequeued_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_PREPARE,
+                                          s.dequeued_ns, s.posted_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_ROUTE, s.dequeued_ns,
+                                          s.route_ready_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_METADATA,
+                                          s.dequeued_ns, s.route_metadata_ns);
+        mooncake::transfer_diag::interval(
+            PerfKey::SD_TENT_DECODE, s.find_buffer_ns, s.decode_metadata_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_FINDBUFFER,
+                                          s.segment_cache_ns, s.find_buffer_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_SEGMENTCACHE,
+                                          s.dequeued_ns, s.segment_cache_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_REMOTEORDER,
+                                          s.decode_metadata_ns,
+                                          s.remote_order_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_LOCALLOCATION,
+                                          s.route_metadata_ns,
+                                          s.route_ready_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_SELECT,
+                                          s.route_ready_ns, s.path_selected_ns);
+        mooncake::transfer_diag::interval(
+            PerfKey::SD_TENT_SEGMENTS, s.path_selected_ns, s.segments_ready_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_COMMIT,
+                                          s.segments_ready_ns, s.posted_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_POST, s.posted_ns,
+                                          s.post_returned_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_DEVICE,
+                                          s.post_returned_ns, s.cqe_seen_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_CQH, s.cqe_seen_ns,
+                                          s.terminal_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_CQWAIT,
+                                          s.cqe_seen_ns, s.inflight_locked_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_CQINFLIGHT,
+                                          s.inflight_locked_ns,
+                                          s.inflight_erased_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_CQRELEASE,
+                                          s.inflight_erased_ns,
+                                          s.resources_released_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_CQRAIL,
+                                          s.resources_released_ns,
+                                          s.rail_recorded_ns);
+        mooncake::transfer_diag::interval(PerfKey::SD_TENT_CQRESOLVE,
+                                          s.rail_recorded_ns, s.terminal_ns);
+    }
+    mooncake::transfer_diag::interval(PerfKey::SD_TENT_BUILD, snap.created_ns,
+                                      first);
+    mooncake::transfer_diag::interval(PerfKey::SD_TENT_FINALIZE, last,
+                                      snap.terminal_ns);
+    mooncake::transfer_diag::taskEdges(batch, snap.created_ns,
+                                       snap.terminal_ns);
 }
 
 // Formats one finished task as a single key=value line. Phases of a slice:
