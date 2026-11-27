@@ -668,7 +668,8 @@ Status UbTransport::submitTransferTask(
             if (task && task->request) trace_bytes += task->request->length;
         }
     }
-    const bool traced = trace_min_bytes > 0 && trace_bytes >= trace_min_bytes;
+    // Diagnostics may populate trace_bytes independently of log sampling.
+    const bool traced = sample_trace && trace_bytes >= trace_min_bytes;
     using TraceClock = std::chrono::steady_clock;
     const auto trace_start =
         traced ? TraceClock::now() : TraceClock::time_point{};

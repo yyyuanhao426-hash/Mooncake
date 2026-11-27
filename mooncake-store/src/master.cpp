@@ -547,14 +547,16 @@ DEFINE_string(pod_namespace, "",
 DEFINE_uint64(put_start_discard_timeout_sec,
               mooncake::DEFAULT_PUT_START_DISCARD_TIMEOUT,
               "Timeout for discarding uncompleted PutStart operations. Set "
-              "both put_start timeouts to zero to force same-size memory "
+              "both put_start timeouts to zero to force same-size "
+              "memory/VSegment "
               "upserts in place despite read leases (concurrent reads may "
               "observe overwritten data); cleanup uses default timeouts");
 DEFINE_uint64(put_start_release_timeout_sec,
               mooncake::DEFAULT_PUT_START_RELEASE_TIMEOUT,
               "Timeout for releasing space allocated in uncompleted PutStart "
               "operations; when both put_start timeouts are zero, cleanup "
-              "uses default timeouts and memory upserts bypass read leases");
+              "uses default timeouts and memory/VSegment upserts bypass read "
+              "leases");
 DEFINE_bool(enable_disk_eviction, true,
             "Enable disk eviction feature for storage backend (default: true)");
 DEFINE_uint64(

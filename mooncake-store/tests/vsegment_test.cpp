@@ -2870,6 +2870,69 @@ TEST(VSegmentIntegrationTest, SizeChangingUpsertReleasesOldAndNewRanges) {
     EXPECT_EQ(full.replica.vsegment_id, original);
 }
 
+TEST(VSegmentIntegrationTest, ZeroTimeoutUpsertReusesLeasedCommittedRange) {
+    const std::string key = "vsegment-zero-timeout-upsert";
+    const auto& tenant = TenantId::Default();
+    const std::string partition_id = std::to_string(cvm::KeySlot(tenant, key));
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {Profile()};
+    quota.quotas = {{partition_id,
+                     "default",
+                     "DRAM",
+                     {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    auto vsegments = std::make_shared<VSegmentService>(quota);
+    ASSERT_EQ(vsegments->AddPartition(partition_id, 1, Committer()),
+              ErrorCode::OK);
+    MasterServiceConfig service_config;
+    service_config.put_start_discard_timeout_sec = 0;
+    service_config.put_start_release_timeout_sec = 0;
+    service_config.default_kv_lease_ttl = 60000;
+    MasterService master(service_config);
+    master.SetVSegmentService(vsegments);
+    ReplicateConfig config;
+    UUID client = generate_uuid();
+    tl::expected<std::optional<PutStartResult>, ErrorCode> started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = master.TryVSegmentPutStart(client, key, tenant, 64, config);
+        if (started && started->has_value()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started && started->has_value());
+    const auto original =
+        (**started).replicas.front().get_vsegment_descriptor();
+    ASSERT_TRUE(master.PutEnd(client, key, tenant, ReplicaType::MEMORY,
+                              (**started).operation_id));
+
+    // More replacements than the quota can hold. Each read renews the lease,
+    // so the normal replacement path would exhaust quota instead of reusing.
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        ASSERT_TRUE(master.GetReplicaList(key, tenant));
+        auto update = master.UpsertStart(client, key, tenant, 64, config);
+        ASSERT_TRUE(update.has_value()) << toString(update.error());
+        ASSERT_EQ(update->size(), 1);
+        const auto& reused = update->front().get_vsegment_descriptor();
+        EXPECT_EQ(reused.vsegment_id, original.vsegment_id);
+        EXPECT_EQ(reused.logical_offset, original.logical_offset);
+        EXPECT_EQ(reused.length, original.length);
+        EXPECT_EQ(reused.operation_id, original.operation_id);
+        auto concurrent = master.UpsertStart(client, key, tenant, 64, config);
+        ASSERT_FALSE(concurrent.has_value());
+        EXPECT_EQ(concurrent.error(), ErrorCode::OBJECT_REPLICA_BUSY);
+        ASSERT_TRUE(master.UpsertEnd(client, key, tenant, ReplicaType::MEMORY));
+    }
+
+    // Revoke an in-place write must release the existing committed range.
+    ASSERT_TRUE(master.UpsertStart(client, key, tenant, 64, config));
+    ASSERT_TRUE(master.UpsertRevoke(client, key, tenant, ReplicaType::MEMORY));
+    auto full = vsegments->StartPutOwned(partition_id, "full-after-zero-upsert",
+                                         Profile().member_extent_size * 2);
+    ASSERT_TRUE(full) << full.detail;
+    EXPECT_EQ(full.replica.vsegment_id, original.vsegment_id);
+}
+
 TEST(VSegmentIntegrationTest, SameSizeUpsertRevokeReleasesCommittedRange) {
     const std::string key = "vsegment-upsert-inplace-revoke";
     const auto& tenant = TenantId::Default();

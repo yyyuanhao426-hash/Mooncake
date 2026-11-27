@@ -10829,8 +10829,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
 // are moved to discarded_replicas_ for delayed release (the previous writer
 // may still be performing RDMA writes to those buffers).
 //
-// Both configured put_start timeouts zero enable same-size memory in-place
-// updates even with read leases. Cleanup still uses the default timeouts and
+// Both configured put_start timeouts zero enable same-size memory/VSegment
+// in-place updates even with read leases. Cleanup uses the default timeouts and
 // concurrent writers are rejected; existing readers can see overwritten data.
 // Note: during Case B the key is temporarily unreadable (all replicas are
 // PROCESSING).  Readers will get REPLICA_IS_NOT_READY until UpsertEnd.
@@ -11090,15 +11090,18 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     }
                 }
 
-                // Explicit benchmark mode: overwrite same-size memory buffers
-                // despite outstanding read leases. Readers with previously
-                // issued descriptors may observe a concurrent overwrite.
-                const bool force_memory_inplace =
+                // Explicit benchmark mode: overwrite same-size memory/VSegment
+                // buffers despite outstanding read leases. Readers with
+                // previously issued descriptors may see a concurrent overwrite.
+                const bool force_buffer_inplace =
                     force_inplace_upsert_ &&
                     metadata.TotalLength() == slice_length &&
-                    metadata.AllReplicas(&Replica::fn_is_memory_replica);
+                    metadata.AllReplicas([](const Replica& replica) {
+                        return replica.is_memory_replica() ||
+                               replica.is_vsegment_replica();
+                    });
                 const bool has_read_lease =
-                    !force_memory_inplace && !metadata.IsLeaseExpired(now);
+                    !force_buffer_inplace && !metadata.IsLeaseExpired(now);
                 if (has_read_lease &&
                     metadata.HasReplica([](const Replica& replica) {
                         return !replica.is_memory_replica() &&

@@ -7,6 +7,13 @@ target_include_directories(
             $<INSTALL_INTERFACE:include>)
 target_compile_features(tent_interface INTERFACE cxx_std_20)
 
+# Inline transfer diagnostics access SpDiag's PerfStat layout. Propagate the
+# SDK's percentile/PerfLog definitions to every TENT compilation unit, including
+# transport archives; linking SpDiag only into the final binary is too late.
+if(TARGET SpDiag::spdiag_lib)
+  target_link_libraries(tent_interface INTERFACE SpDiag::spdiag_lib)
+endif()
+
 # ascend_affinity.h lives next to the shared allocator implementation, but TENT
 # headers (tent/transport/ascend/ascend_direct_transport.h) include it, so the
 # header directory must be on every TENT consumer's include path.
